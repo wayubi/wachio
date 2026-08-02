@@ -83,14 +83,14 @@ class Rachio
 {
 	private static $timezone = 'America/Denver'; // fallback if schedule.php omits it
 	private static $rain_delay_days = 7; // max 7
-	private static $dry_run = true; // true = never send requests to Rachio
+	private static $dry_run = true; // fallback if schedule.php omits it
 
 	private static $zones = []; // populated from schedule.php at runtime
 
 	/**
-	 * Loads the schedule (timezone + zones) from schedule.php, falling back to
-	 * schedule.example.php if it is missing. See schedule.example.php for the
-	 * full set of zone options.
+	 * Loads the schedule (timezone, dry_run + zones) from schedule.php, falling
+	 * back to schedule.example.php if it is missing. See schedule.example.php
+	 * for the full set of options.
 	 */
 	private static function schedule()
 	{
@@ -117,14 +117,12 @@ class Rachio
 		$schedule = static::schedule();
 		static::$timezone = $schedule['timezone'] ?? static::$timezone;
 		static::$zones    = $schedule['zones'] ?? [];
+		static::$dry_run  = $schedule['dry_run'] ?? static::$dry_run;
 
 		date_default_timezone_set(static::$timezone);
 		$now      = time();
-		var_dump($now);
 		$now_date = date('Y-m-d', $now);
-		var_dump($now_date);
 		$now_time = date('H:i', $now);
-		var_dump($now_time);
 		$dow      = (int) date('N', $now); // 1=Mon .. 7=Sun
 
 		$due = static::dueZones($options['zone'], $now_time, $dow);
@@ -398,8 +396,6 @@ class Weather
 				'rain' => $precip > 50,
 			];
 		}
-
-		var_dump($data);
 
 		static::$data = $data;
 	}

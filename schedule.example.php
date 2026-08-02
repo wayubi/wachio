@@ -7,7 +7,10 @@
  * This example file is committed so that anyone cloning the repo knows the
  * format. The script falls back to this file only if schedule.php is missing.
  *
- * Returns: [ 'timezone' => string, 'zones' => [ zoneNumber => config ] ]
+ * Returns: [ 'timezone' => string, 'dry_run' => bool, 'zones' => [ zoneNumber => config ] ]
+ *
+ * - dry_run : true = compute and print what would be sent, never touch Rachio.
+ *             Set to false to actually water.
  *
  * Zone options:
  *
@@ -34,6 +37,7 @@
 
 return [
 	'timezone' => 'America/Denver', // your local timezone
+	'dry_run'  => true,             // true = never send requests to Rachio
 
 	'zones' => [
 		1 => [

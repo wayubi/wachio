@@ -13,7 +13,7 @@ The controller's own scheduling is bypassed in favor of a configurable per-zone 
 - **Safety caps** — optional per-zone `max_runtime`; checks the controller isn't already watering before starting.
 - **Fixed runtimes** — optional per-zone `fixed_runtime` for zones that must always run the same duration, bypassing temperature.
 - **API-friendly** — no polling. When nothing is scheduled it exits before making any request (Rachio allows 3,500 req/day).
-- **Dry-run mode** — **on by default** (`$dry_run = true`): the script prints exactly what it would send and never touches Rachio, until you flip it to `false`.
+- **Dry-run mode** — **on by default** (`'dry_run' => true` in `schedule.php`): the script prints exactly what it would send and never touches Rachio, until you flip it to `false`.
 
 ## Requirements
 
@@ -42,7 +42,7 @@ docker compose logs -f
 
 ### Verify before you water
 
-Dry-run is **on by default**, so nothing is ever sent to Rachio until you flip `$dry_run` to `false` (run.php). These commands still let you inspect behavior:
+Dry-run is **on by default**, so nothing is ever sent to Rachio until you flip `'dry_run' => true` to `false` (in `schedule.php`). These commands still let you inspect behavior:
 
 ```sh
 # Show what would happen right now (safe, makes no changes)
@@ -51,7 +51,7 @@ docker compose run --rm wachio php /app/run.php --dry-run
 # Force-preview one zone (still no watering)
 docker compose run --rm wachio php /app/run.php --dry-run --zone 4
 
-# Force-preview one zone (still no watering, since $dry_run defaults to true)
+# Force-preview one zone (still no watering, since 'dry_run' defaults to true)
 docker compose run --rm wachio php /app/run.php --zone 4
 ```
 
@@ -66,11 +66,11 @@ The container runs BusyBox `crond` and executes `run.php` every minute. The scri
 3. Otherwise it fetches the controller (person → device), checks for an active rain delay or an already-running schedule.
 4. Pulls the forecast from [Open-Meteo](https://open-meteo.com) (free, no API key) using the controller's latitude/longitude.
 5. Skips if rain is forecast within the check window, or a zone's temperature is below its `min_temp`.
-6. Computes each due zone's runtime, then calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `$dry_run`), in which case it prints the would-be payload and exits.
+6. Computes each due zone's runtime, then calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `'dry_run'`), in which case it prints the would-be payload and exits.
 
 ## Configuration
 
-The **schedule** (timezone + zones) lives in `schedule.php`, which is **gitignored** — change it freely and it takes effect on the next cron tick without a restart. It's never committed or pushed. `schedule.example.php` is the committed, documented template (and the fallback if `schedule.php` is missing); copy it to `schedule.php` and edit. It ships with eight example zones (zone 1 active, 2–8 commented out) covering every option.
+The **schedule** (timezone, dry-run, zones) lives in `schedule.php`, which is **gitignored** — change it freely and it takes effect on the next cron tick without a restart. It's never committed or pushed. `schedule.example.php` is the committed, documented template (and the fallback if `schedule.php` is missing); copy it to `schedule.php` and edit. It ships with eight example zones (zone 1 active, 2–8 commented out) covering every option.
 
 Everything else (API safety, weather, runtime-model knobs) lives in `run.php` under the `W\Rachio` and `W\Model` classes.
 
@@ -80,13 +80,13 @@ Everything else (API safety, weather, runtime-model knobs) lives in `run.php` un
 private static $timezone = 'America/Denver';      // fallback only — effective value lives in schedule.php
 private static $rain_check_days = 2;              // skip watering if rain forecast within N days (W\Model)
 private static $rain_delay_days = 7;              // unused by the current flow; kept from the original
-private static $dry_run = true;                   // true = never send requests to Rachio
+private static $dry_run = true;                   // fallback only — effective value lives in schedule.php
 private static $temperature_floor = 55;           // °F, no watering at or below this (W\Model)
 private static $temperature_full  = 90;           // °F, 100% of runtime_basis at this (W\Model)
 ```
 
 - **`$timezone`** — in `run.php` this is only the **fallback**; the effective timezone is set in `schedule.php`, which overrides it. Schedules are evaluated in that timezone with no API lookups, so it must match where you want watering times interpreted.
-- **`$dry_run`** — when `true`, the script computes everything but prints the would-be payload instead of calling `start_multiple`. **Defaults to `true`** so nothing waters until you flip it to `false`. The `--dry-run` CLI flag works independently and forces dry-run even when this is `false`.
+- **`$dry_run`** — in `run.php` this is only the **fallback**; the effective value is `'dry_run'` in `schedule.php`. When `true`, the script computes everything but prints the would-be payload instead of calling `start_multiple`. **Defaults to `true`** so nothing waters until you flip it to `false`. The `--dry-run` CLI flag works independently and forces dry-run even when this is `false`.
 - **`$rain_check_days`** — lives in `W\Model`; the number of forecast days examined for rain. See [Rain & weather](#rain--weather).
 - **`$temperature_floor` / `$temperature_full`** — live in `W\Model`; the temperature curve anchors. Watering stops entirely at or below the floor, and reaches 100% of `runtime_basis` at the full temperature.
 
@@ -186,7 +186,7 @@ crontab               Runs `php /app/run.php` every minute
 - **`RACHIO_TOKEN environment variable is not set`** — add your token to `compose.override.yml` (or set `RACHIO_TOKEN` in your environment) and recreate the container: `docker compose up -d`.
 - **`HTTP 401 ... The client is not authorized`** — the token is wrong or was revoked.
 - **Nothing ever waters** — check your `days`/`times` against the configured `$timezone`, and the zone numbers against your controller. Use `--dry-run` to see what the script is deciding.
-- **It only ever dry-runs** — `$dry_run` defaults to `true`; flip it to `false` (in `run.php`) to actually send requests to Rachio.
+- **It only ever dry-runs** — `'dry_run'` defaults to `true`; flip it to `false` (in `schedule.php`) to actually send requests to Rachio.
 - **`start_multiple` rejects the payload** — see the note below.
 
 ## Known caveat
