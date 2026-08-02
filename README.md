@@ -64,10 +64,10 @@ The container runs BusyBox `crond` and executes `run.php` every minute. The scri
 1. Computes the local time from the configured timezone and checks which zones are **due** (`schedule.php` config only — no network calls).
 2. If nothing is due, it prints `Nothing scheduled` and exits immediately.
 3. Otherwise it fetches the controller (person → device) and checks for an active rain delay.
-4. Pulls the forecast from [Open-Meteo](https://open-meteo.com) (free, no API key) using the controller's latitude/longitude.
+4. Pulls the forecast from [Open-Meteo](https://open-meteo.com) (free, no API key) using the controller's latitude/longitude. Transient failures (429/5xx) are retried; if the forecast is still unavailable it falls back to a cached copy from the last 12 hours, or runs at full temperature (see [Rain & weather](#rain--weather)).
 5. Skips if rain is forecast within the check window, or a zone's temperature is below its `min_temp`.
 6. Computes each due zone's runtime, then — immediately before calling `start_multiple` — checks the controller's live state via `getDeviceState`; if it's anything but `IDLE` (e.g. a manual zone is running), it aborts and leaves it alone.
-7. Calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `'dry_run'`), in which case it prints the would-be payload and exits.
+7. Calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `'dry_run'`), in which case it prints the would-be payload and exits. Same-tick zones are batched into that one call and run sequentially by `sortOrder`.
 
 ## Configuration
 
@@ -167,6 +167,7 @@ duration   = min(per_run, max_runtime)
 - **Source:** [Open-Meteo](https://open-meteo.com) forecast for the controller's coordinates — free, no account or key needed.
 - **Rain skip:** watering is skipped if precipitation probability exceeds 50% on any day within `rain_check_days` (default 2).
 - **Rain delay:** if a rain delay is active on the controller (`rainDelayExpirationDate`), watering is skipped.
+- **Resilience:** every successful forecast is cached to `/tmp/wachio_weather.json` (with a timestamp). Transient Open-Meteo failures (HTTP 429/500/502/503/504) are retried up to 3× with short backoff. If the forecast is still unavailable, the script uses the cached copy when it's **≤12h old** (rain check and temperature scaling still apply); otherwise it waters at **full dose** — the temperature model is treated as at the full temperature (no rain check, since no forecast is available). This means a temporary weather outage never causes a missed watering, and never crashes the tick.
 
 ## Project layout
 
