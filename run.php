@@ -8,51 +8,28 @@ namespace W;
  *
  * A per-zone schedule drives when zones water; runtimes are computed from the
  * forecast temperature; watering is skipped on rain, cold, or an active rain
- * delay on the controller.
- *
- * LICENSE: The MIT License (MIT)
- *
- * Copyright (c) 2015 Waheed Ayubi
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * delay on the controller. MIT licensed - see LICENSE.
  */
 
 class Model
 {
-	private static $debug = false;
 	private static $rain_check_days = 2; // max 10
 	private static $temperature_floor = 55; // F, no watering at or below this
 	private static $temperature_full  = 90; // F, 100% of runtime_basis at this
 
 	private static $calendar = [
-		1  => ['name' => 'January',   'temperature_basis' => 'Low',  'multiplier' => 1.0],
-		2  => ['name' => 'February',  'temperature_basis' => 'Low',  'multiplier' => 1.0],
-		3  => ['name' => 'March',     'temperature_basis' => 'Avg',  'multiplier' => 1.0],
-		4  => ['name' => 'April',     'temperature_basis' => 'Avg',  'multiplier' => 1.0],
-		5  => ['name' => 'May',       'temperature_basis' => 'Avg',  'multiplier' => 1.0],
-		6  => ['name' => 'June',      'temperature_basis' => 'High', 'multiplier' => 1.0],
-		7  => ['name' => 'July',      'temperature_basis' => 'High', 'multiplier' => 1.0],
-		8  => ['name' => 'August',    'temperature_basis' => 'High', 'multiplier' => 1.0],
-		9  => ['name' => 'September', 'temperature_basis' => 'Avg',  'multiplier' => 1.0],
-		10 => ['name' => 'October',   'temperature_basis' => 'Avg',  'multiplier' => 1.0],
-		11 => ['name' => 'November',  'temperature_basis' => 'Avg',  'multiplier' => 1.0],
-		12 => ['name' => 'December',  'temperature_basis' => 'Low',  'multiplier' => 1.0],
+		1  => ['temperature_basis' => 'Low',  'multiplier' => 1.0],
+		2  => ['temperature_basis' => 'Low',  'multiplier' => 1.0],
+		3  => ['temperature_basis' => 'Avg',  'multiplier' => 1.0],
+		4  => ['temperature_basis' => 'Avg',  'multiplier' => 1.0],
+		5  => ['temperature_basis' => 'Avg',  'multiplier' => 1.0],
+		6  => ['temperature_basis' => 'High', 'multiplier' => 1.0],
+		7  => ['temperature_basis' => 'High', 'multiplier' => 1.0],
+		8  => ['temperature_basis' => 'High', 'multiplier' => 1.0],
+		9  => ['temperature_basis' => 'Avg',  'multiplier' => 1.0],
+		10 => ['temperature_basis' => 'Avg',  'multiplier' => 1.0],
+		11 => ['temperature_basis' => 'Avg',  'multiplier' => 1.0],
+		12 => ['temperature_basis' => 'Low',  'multiplier' => 1.0],
 	];
 
 	public static function getRainCheckDays()
@@ -68,8 +45,6 @@ class Model
 
 	public static function getRunDose($basis, $temperature)
 	{
-		if (static::$debug) return 1;
-
 		$factor = ((float) $temperature - static::$temperature_floor)
 		        / (static::$temperature_full - static::$temperature_floor);
 		$factor = max(0.0, min(1.0, $factor));
@@ -157,12 +132,6 @@ class Rachio
 				exit(0);
 			}
 
-			$schedule = Curl::request('https://api.rach.io/1/public/device/' . $device_id . '/current_schedule', $headers);
-			if (static::isWatering($schedule)) {
-				echo '=== Stopping: controller is already watering ===' . PHP_EOL;
-				exit(0);
-			}
-
 			Weather::request($latitude, $longitude, static::$timezone);
 
 			if (Weather::rainForecast()) {
@@ -186,6 +155,13 @@ class Rachio
 			if ($dry_run) {
 				echo sprintf('[dry-run] temperature(%s) = %dF', $temperature_basis, $temperature) . PHP_EOL;
 				echo '[dry-run] would PUT ' . $payload . PHP_EOL;
+				exit(0);
+			}
+
+			$state = static::deviceState($device_id, $headers);
+			echo '[status] controller state: ' . $state . PHP_EOL;
+			if ($state !== 'IDLE') {
+				echo '=== Stopping: controller is not idle (a zone may be running) ===' . PHP_EOL;
 				exit(0);
 			}
 
@@ -270,11 +246,15 @@ class Rachio
 		return true;
 	}
 
-	private static function isWatering($schedule)
+	private static function deviceState($device_id, $headers)
 	{
-		if (!$schedule instanceof \stdClass) return false;
-		if (!isset($schedule->zones)) return false;
-		return count($schedule->zones) > 0;
+		$result = Curl::request('https://cloud-rest.rach.io/device/getDeviceState/' . $device_id, $headers);
+		$state  = $result->state->state ?? $result->state ?? null;
+		if (!is_string($state)) {
+			echo '[status] getDeviceState unexpected: ' . json_encode($result) . PHP_EOL;
+			return '';
+		}
+		return $state;
 	}
 
 	private static function buildZones($due, $device, $temperature)
@@ -350,8 +330,6 @@ class Weather
 
 	public static function request($latitude, $longitude, $timezone)
 	{
-		date_default_timezone_set($timezone);
-
 		$url = 'https://api.open-meteo.com/v1/forecast?' . http_build_query([
 			'latitude'         => $latitude,
 			'longitude'        => $longitude,

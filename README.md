@@ -10,7 +10,7 @@ The controller's own scheduling is bypassed in favor of a configurable per-zone 
 - **Temperature-based runtimes** — hotter days water longer, scaling linearly from 0 at 55°F to 100% of the basis at 90°F (using daily high/low/avg per month).
 - **Rain-aware** — skips watering when the forecast predicts rain (>50% chance within 2 days) or a rain delay is active on the controller.
 - **Cold protection** — optional per-zone `min_temp` floor (no watering below a temperature).
-- **Safety caps** — optional per-zone `max_runtime`; checks the controller isn't already watering before starting.
+- **Safety caps** — optional per-zone `max_runtime`; verifies the controller is `IDLE` (via `getDeviceState`) right before starting, so manual/other zones are never interrupted.
 - **Fixed runtimes** — optional per-zone `fixed_runtime` for zones that must always run the same duration, bypassing temperature.
 - **API-friendly** — no polling. When nothing is scheduled it exits before making any request (Rachio allows 3,500 req/day).
 - **Dry-run mode** — **on by default** (`'dry_run' => true` in `schedule.php`): the script prints exactly what it would send and never touches Rachio, until you flip it to `false`.
@@ -63,10 +63,11 @@ The container runs BusyBox `crond` and executes `run.php` every minute. The scri
 
 1. Computes the local time from the configured timezone and checks which zones are **due** (`schedule.php` config only — no network calls).
 2. If nothing is due, it prints `Nothing scheduled` and exits immediately.
-3. Otherwise it fetches the controller (person → device), checks for an active rain delay or an already-running schedule.
+3. Otherwise it fetches the controller (person → device) and checks for an active rain delay.
 4. Pulls the forecast from [Open-Meteo](https://open-meteo.com) (free, no API key) using the controller's latitude/longitude.
 5. Skips if rain is forecast within the check window, or a zone's temperature is below its `min_temp`.
-6. Computes each due zone's runtime, then calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `'dry_run'`), in which case it prints the would-be payload and exits.
+6. Computes each due zone's runtime, then — immediately before calling `start_multiple` — checks the controller's live state via `getDeviceState`; if it's anything but `IDLE` (e.g. a manual zone is running), it aborts and leaves it alone.
+7. Calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `'dry_run'`), in which case it prints the would-be payload and exits.
 
 ## Configuration
 
