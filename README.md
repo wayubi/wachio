@@ -55,7 +55,7 @@ docker compose run --rm wachio php /app/run.php --dry-run --zone 4
 docker compose run --rm wachio php /app/run.php --zone 4
 ```
 
-> `--zone N` forces that single zone to run and treats it as one run today (so a twice-daily zone gets its full daily dose, not half).
+> `--zone N` forces that single zone to run once, regardless of its schedule.
 
 ## How it works
 
@@ -79,7 +79,6 @@ Everything else (API safety, weather, runtime-model knobs) lives in `run.php` un
 ```php
 private static $timezone = 'America/Denver';      // fallback only — effective value lives in schedule.php
 private static $rain_check_days = 2;              // skip watering if rain forecast within N days (W\Model)
-private static $rain_delay_days = 7;              // unused by the current flow; kept from the original
 private static $dry_run = true;                   // fallback only — effective value lives in schedule.php
 private static $temperature_floor = 55;           // °F, no watering at or below this (W\Model)
 private static $temperature_full  = 90;           // °F, 100% of runtime_basis at this (W\Model)
@@ -115,7 +114,7 @@ Every option:
 - **`enabled`** — **required to run.** Only zones with `'enabled' => true` are handled by this script; absent or `false` disables the zone (e.g. a zone you manage through the Rachio app). Disabled zones are skipped even if they have `times` set, and `--zone N` overrides skip too.
 - **`times`** — required. Any number of `HH:MM` start times; the same set applies on every scheduled day. An empty array disables the zone.
 - **`days`** — optional. `null` = every day, or an array of weekdays where `1`=Mon … `7`=Sun.
-- **`runtime_basis`** — the watering duration in minutes at the *full* temperature (`$temperature_full`, 90°F). Runtime scales linearly from `0` at the *floor* (`$temperature_floor`, 55°F) to 100% at the full temperature (see [Runtime model](#runtime-model)). Set to `0` (and/or empty `times`) to disable a zone.
+- **`runtime_basis`** — the watering duration **per run** at the *full* temperature (`$temperature_full`, 90°F). Every scheduled run gets this amount, scaled linearly from `0` at the *floor* (`$temperature_floor`, 55°F) to 100% at the full temperature (see [Runtime model](#runtime-model)). A zone with `runtime_basis` 3 running 5 times a day gets ~3 minutes per run (≈15 min/day). Set to `0` (and/or empty `times`) to disable a zone.
 - **`fixed_runtime`** — optional. A fixed duration in minutes that **bypasses the temperature model entirely** and ignores `runtime_basis`. Use for a zone that must always run the same amount (e.g. `'fixed_runtime' => 1` = exactly 1 minute regardless of weather). Cannot be combined with a temperature-based basis — pick one.
 - **`max_runtime`** — optional. Caps a temperature-computed per-run duration in minutes. Not applied to `fixed_runtime` zones.
 - **`min_temp`** — optional. Skips the zone when the day's temperature is below this value (°F). Useful to avoid watering near freezing.
@@ -151,16 +150,15 @@ Zone keys must match the zone numbers reported by your controller (`GET /public/
 
 ```
 factor     = clamp((temperature − floor) / (full − floor), 0, 1)   (floor=55°F, full=90°F)
-daily_dose = runtime_basis × factor × month_multiplier
-per_run    = daily_dose / (number of runs scheduled today)
+per_run    = runtime_basis × factor × month_multiplier
 duration   = min(per_run, max_runtime)
 ```
 
 - `temperature` is the forecast high, avg, or low depending on the month (see `W\Model::$calendar` — summer uses daily high, winter uses daily low).
 - `month_multiplier` is a per-month tuning knob (defaults to `1.0`).
 - The **floor** (55°F) means no watering at or below that temperature — this also supersedes a per-zone `min_temp` unless you want a stricter zone override. The **full** temperature (90°F) gives 100% of `runtime_basis`; hotter days plateau there rather than running longer.
-- **Example:** at 88°F, `factor = (88−55)/(90−55) = 0.94`, so a zone with `runtime_basis` 5 gets 4.7 min ≈ 283s.
-- **Multiple runs per day** — the **daily** dose is split evenly across the day's scheduled runs, so total daily water stays consistent regardless of how many times the zone runs (e.g. 2 runs/day → half the daily dose each).
+- **Example:** at 88°F, `factor = (88−55)/(90−55) = 0.94`, so a zone with `runtime_basis` 5 gets 4.7 min ≈ 283s **per run**.
+- **Per-run basis** — `runtime_basis` is a **per-run** amount, not a daily total. Each scheduled run gets the full scaled dose, so more runs/day means more total water (e.g. `runtime_basis` 3 × 5 runs/day ≈ 15 min/day at the full temperature).
 - **`fixed_runtime`** — zones with a `fixed_runtime` skip this whole model and use the fixed minutes directly.
 
 ## Rain & weather

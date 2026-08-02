@@ -17,9 +17,10 @@
  * - enabled        : required to run. Only zones with 'enabled' => true are
  *                    handled by this script; absent/false = disabled (e.g.
  *                    zones managed by the Rachio app)
- * - runtime_basis : minutes of water at the full temperature (90F). Runtime
- *                   scales linearly from 0 at the floor (55F) to 100% at the
- *                   full temperature
+ * - runtime_basis : minutes per run at the full temperature (90F). Each
+ *                   scheduled run gets this amount, scaled linearly from 0 at
+ *                   the floor (55F) to 100% at the full temperature. Run a
+ *                   zone 5 times a day and it gets that much water each time
  * - fixed_runtime : optional fixed minutes per run (bypasses temperature
  *                   model; ignores runtime_basis)
  * - max_runtime   : optional per-run cap in minutes

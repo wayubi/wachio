@@ -66,7 +66,7 @@ class Model
 		return static::$calendar[date('n')]['temperature_basis'];
 	}
 
-	public static function getDailyDose($basis, $temperature)
+	public static function getRunDose($basis, $temperature)
 	{
 		if (static::$debug) return 1;
 
@@ -82,7 +82,6 @@ class Model
 class Rachio
 {
 	private static $timezone = 'America/Denver'; // fallback if schedule.php omits it
-	private static $rain_delay_days = 7; // max 7
 	private static $dry_run = true; // fallback if schedule.php omits it
 
 	private static $zones = []; // populated from schedule.php at runtime
@@ -121,7 +120,6 @@ class Rachio
 
 		date_default_timezone_set(static::$timezone);
 		$now      = time();
-		$now_date = date('Y-m-d', $now);
 		$now_time = date('H:i', $now);
 		$dow      = (int) date('N', $now); // 1=Mon .. 7=Sun
 
@@ -175,7 +173,7 @@ class Rachio
 			$temperature_basis = Model::getTemperatureBasis(static::$timezone);
 			$temperature       = (int) Weather::getTemperature($temperature_basis);
 
-			$start_zones = static::buildZones($due, $device, $temperature, $dow, $options['zone'] !== null);
+			$start_zones = static::buildZones($due, $device, $temperature);
 
 			if (empty($start_zones)) {
 				echo '=== No zones to water ===' . PHP_EOL;
@@ -272,16 +270,6 @@ class Rachio
 		return true;
 	}
 
-	private static function runsToday($zone, $dow)
-	{
-		$runs = 0;
-		foreach (static::schedulesForZone($zone) as $schedule) {
-			if ($schedule['days'] !== null && !in_array($dow, $schedule['days'], true)) continue;
-			$runs += count($schedule['times']);
-		}
-		return $runs;
-	}
-
 	private static function isWatering($schedule)
 	{
 		if (!$schedule instanceof \stdClass) return false;
@@ -289,7 +277,7 @@ class Rachio
 		return count($schedule->zones) > 0;
 	}
 
-	private static function buildZones($due, $device, $temperature, $dow, $is_override)
+	private static function buildZones($due, $device, $temperature)
 	{
 		$start_zones = [];
 		$sort_order  = 1;
@@ -330,9 +318,7 @@ class Rachio
 				$duration = (int) $zone['fixed_runtime'] * 60;
 				$basis    = (int) $zone['fixed_runtime'] . 'm';
 			} else {
-				$daily_dose = (float) Model::getDailyDose($zone['runtime_basis'], $temperature);
-				$runs_today = $is_override ? 1 : static::runsToday($zone, $dow);
-				$per_run    = $daily_dose / max(1, $runs_today);
+				$per_run = (float) Model::getRunDose($zone['runtime_basis'], $temperature);
 				if (isset($zone['max_runtime']) && $per_run > (int) $zone['max_runtime']) {
 					$per_run = (float) $zone['max_runtime'];
 				}
