@@ -37,6 +37,11 @@ class Model
 		return (int) static::$rain_check_days;
 	}
 
+	public static function getTemperatureFull()
+	{
+		return (int) static::$temperature_full;
+	}
+
 	public static function getTemperatureBasis($timezone)
 	{
 		date_default_timezone_set($timezone);
@@ -327,6 +332,10 @@ class Rachio
 class Weather
 {
 	private static $data = [];
+	private static $fallback_full = false;
+
+	private const CACHE_FILE    = '/tmp/wachio_weather.json';
+	private const CACHE_MAX_AGE = 12 * 3600; // 12 hours
 
 	public static function request($latitude, $longitude, $timezone)
 	{
@@ -339,18 +348,61 @@ class Weather
 			'forecast_days'    => 7,
 		]);
 
-		$result = Curl::request($url);
-		if (!isset($result->daily) || !isset($result->daily->time)) {
+		try {
+			$result = static::fetch($url);
+			$data   = static::buildDaily($result);
+
+			static::$data = $data;
+			static::$fallback_full = false;
+			static::writeCache($data);
+			return;
+		} catch (\RuntimeException $e) {
+			$cached = static::readCache();
+			if ($cached !== null) {
+				static::$data = $cached['data'];
+				static::$fallback_full = false;
+				$age_h = (int) ceil((time() - $cached['ts']) / 3600);
+				echo sprintf('[weather] using cached forecast (%dh old)', $age_h) . PHP_EOL;
+				return;
+			}
+
+			static::$data = [];
+			static::$fallback_full = true;
+			echo '[weather] no fresh forecast available — running at full dose' . PHP_EOL;
+		}
+	}
+
+	private static function fetch($url)
+	{
+		$transient = [429, 500, 502, 503, 504];
+		$attempts  = 3;
+
+		for ($try = 1; $try <= $attempts; $try++) {
+			try {
+				return Curl::request($url);
+			} catch (HttpException $e) {
+				if (in_array($e->getCode(), $transient, true) && $try < $attempts) {
+					sleep($try * 2);
+					continue;
+				}
+				throw $e;
+			}
+		}
+	}
+
+	private static function buildDaily($data)
+	{
+		if (!isset($data->daily) || !isset($data->daily->time)) {
 			throw new \RuntimeException('Unexpected weather response');
 		}
 
-		$daily = $result->daily;
+		$daily = $data->daily;
 		$data  = [];
 
 		for ($i = 0; $i < count($daily->time); $i++) {
-			$date  = (string) $daily->time[$i];
-			$high  = (int) $daily->temperature_2m_max[$i];
-			$low   = (int) $daily->temperature_2m_min[$i];
+			$date   = (string) $daily->time[$i];
+			$high   = (int) $daily->temperature_2m_max[$i];
+			$low    = (int) $daily->temperature_2m_min[$i];
 			$precip = (int) ( $daily->precipitation_probability_max[$i] ?? 0 );
 
 			$data[$date] = [
@@ -361,11 +413,35 @@ class Weather
 			];
 		}
 
-		static::$data = $data;
+		return $data;
+	}
+
+	private static function writeCache($data)
+	{
+		@file_put_contents(static::CACHE_FILE, json_encode([
+			'cached_at' => time(),
+			'data'      => $data,
+		]));
+	}
+
+	private static function readCache()
+	{
+		$raw = @file_get_contents(static::CACHE_FILE);
+		$j   = json_decode($raw === false ? '' : $raw, true);
+		if (!is_array($j) || !isset($j['cached_at'], $j['data']) || !is_array($j['data'])) {
+			return null;
+		}
+		if (time() - (int) $j['cached_at'] > static::CACHE_MAX_AGE) {
+			return null;
+		}
+
+		return ['ts' => (int) $j['cached_at'], 'data' => $j['data']];
 	}
 
 	public static function rainForecast()
 	{
+		if (static::$fallback_full) return false;
+
 		$i = 0;
 		foreach (static::$data as $data) {
 			if ($i == Model::getRainCheckDays()) break;
@@ -378,6 +454,10 @@ class Weather
 
 	public static function getTemperature($basis)
 	{
+		if (static::$fallback_full) {
+			return (int) Model::getTemperatureFull();
+		}
+
 		$key = date('Y-m-d');
 		if (!isset(static::$data[$key]) || !isset(static::$data[$key][strtolower($basis)])) {
 			throw new \RuntimeException('No temperature data for ' . $key);
@@ -385,6 +465,10 @@ class Weather
 
 		return (int) static::$data[$key][strtolower($basis)];
 	}
+}
+
+class HttpException extends \RuntimeException
+{
 }
 
 class Curl
@@ -412,7 +496,7 @@ class Curl
 			throw new \RuntimeException('cURL error: ' . $error);
 		}
 		if ($status < 200 || $status >= 300) {
-			throw new \RuntimeException('HTTP ' . $status . ' for ' . $url . ': ' . $result);
+			throw new HttpException('HTTP ' . $status . ' for ' . $url . ': ' . $result, $status);
 		}
 
 		return json_decode($result);
