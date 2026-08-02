@@ -1,7 +1,6 @@
 services:
   wachio:
     build: .
-    container_name: wachio
     restart: unless-stopped
     volumes:
       - ./run.php:/app/run.php
