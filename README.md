@@ -56,12 +56,17 @@ docker compose run --rm wachio php /app/run.php --dry-run --zone 4
 # Force-recompute an auto_schedule zone's daily schedule (debugging/testing)
 docker compose run --rm wachio php /app/run.php --dry-run --zone 4 --recompute-schedule
 
+# Simulate 5:30 AM to preview an auto_schedule zone's morning run (testing only)
+docker compose run --rm wachio php /app/run.php --dry-run --zone 3 \
+  --now="2026-08-08 05:30" --recompute-schedule
+
 # Force-preview one zone (still no watering, since 'dry_run' defaults to true)
 docker compose run --rm wachio php /app/run.php --zone 4
 ```
 
 > `--zone N` forces that single zone to run once, regardless of its schedule. For an `auto_schedule` zone run outside one of its scheduled times, the duration used is the **first entry** of that day's schedule — which, if the zone is cycle-split, may be a short sub-cycle rather than a full-length run.
 > `--recompute-schedule` discards today's cached `auto_schedule` run lists and rebuilds them from a fresh weather fetch (see [Auto schedule](#auto-schedule)). When combined with `--zone N`, only that zone is rebuilt.
+> `--now="YYYY-MM-DD HH:MM"` — simulate a specific date/time to test schedule logic (e.g. verifying an `auto_schedule` zone's computed run times actually fire) without waiting for the real clock or touching the container's system time. It overrides the clock for **scheduling decisions only**; cache `computed_at` and weather `cached_at` timestamps still reflect real time, and `ScheduleCache::cleanup()` still uses real file mtimes. **Testing aid only — not intended for production cron use** — always combine with `--dry-run` to avoid accidentally watering.
 
 ## How it works
 
@@ -195,6 +200,7 @@ The bucket is the water depth applied per cycle (identical to the `auto_runtime`
 - Run times start at `window_start` and are spaced by `interval_hr`, stopping at midnight or `max_runs` (default 6), rounded to the nearest minute. Zones water every day — there is no per-week `days` concept for `auto_schedule`.
 - Durations are frozen at schedule-build time: temperature scaling, `max_runtime`, and cycle-splitting are all applied when the day's schedule is computed (using that morning's forecast temperature), so a hot afternoon won't lengthen that afternoon's run. This is what keeps split sub-cycles consistent within a day.
 - **Daily caching** — the computed run list is written to `/tmp/wachio_schedule_<zone>_<date>.json` and reused by every cron tick that day, so a mid-day forecast change can't shift the run times. The first tick of a day that needs a schedule does the real computation (one controller + one weather fetch); stale caches older than 2 days are cleaned up on each run. `--recompute-schedule` forces a rebuild for testing (all auto_schedule zones, or just `--zone N` when both flags are passed).
+- **Testing with `--now`** — combining `--now="YYYY-MM-DD HH:MM"` with `--recompute-schedule` (and `--dry-run`) is the recommended way to verify a zone's full daily schedule at a specific simulated time without waiting for the real clock. Note that simulating a future date writes that date's cache file, which the real cron will reuse on that day — benign (it's built from the forecast for that date), but delete `/tmp/wachio_schedule_*_<date>.json` after testing if you don't want that.
 - **ET₀ units** — Open-Meteo returns `et0_fao_evapotranspiration` in **millimeters** by default; the script requests it in **inches** (`precipitation_unit=inch`) and also converts `mm → in` (÷ 25.4) defensively if the response reports mm. The value shown in the `[interval]` log line is already in inches/day.
 - **Missing ET₀** — if the forecast is unavailable or today's ET₀ is missing/≤0, a conservative fallback of **0.20 in/day** is used and logged (`[weather] no ET0 for today — using fallback 0.20 in/day`), so a weather outage can't crash the run.
 - **Validation** — if `auto_schedule` is set but `window_start` is missing, the controller reports no crop coefficient (`customCrop.coefficient` missing/0), or the bucket inputs can't be resolved, the zone is skipped with a clear `[interval]`/`[schedule]` message, and an empty result is cached so the message is logged once per day rather than every minute.

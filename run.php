@@ -45,7 +45,7 @@ class Model
 	public static function getTemperatureBasis($timezone)
 	{
 		date_default_timezone_set($timezone);
-		return static::$calendar[date('n')]['temperature_basis'];
+		return static::$calendar[date('n', Clock::now())]['temperature_basis'];
 	}
 
 	public static function getRunDose($basis, $temperature)
@@ -54,8 +54,28 @@ class Model
 		        / (static::$temperature_full - static::$temperature_floor);
 		$factor = max(0.0, min(1.0, $factor));
 
-		$multiplier = (float) static::$calendar[date('n')]['multiplier'];
+		$multiplier = (float) static::$calendar[date('n', Clock::now())]['multiplier'];
 		return (float) ( $basis * $factor * $multiplier );
+	}
+}
+
+class Clock
+{
+	private static $override = null; // set by --now (testing only)
+
+	public static function now()
+	{
+		return static::$override ?? time();
+	}
+
+	public static function set($ts)
+	{
+		static::$override = $ts;
+	}
+
+	public static function isOverridden()
+	{
+		return static::$override !== null;
 	}
 }
 
@@ -104,7 +124,18 @@ class Rachio
 		static::$recompute_schedule = (bool) $options['recompute_schedule'];
 
 		date_default_timezone_set(static::$timezone);
-		$now      = time();
+
+		if ($options['now'] !== null) {
+			$ts = strtotime($options['now']);
+			if ($ts === false) {
+				fwrite(STDERR, 'Invalid --now value: ' . $options['now'] . ' (expected e.g. "2026-08-08 05:30")' . PHP_EOL);
+				exit(1);
+			}
+			Clock::set($ts);
+			echo '[now] Simulating now = ' . date('Y-m-d H:i:s', $ts) . PHP_EOL;
+		}
+
+		$now      = Clock::now();
 		$now_time = date('H:i', $now);
 		$dow      = (int) date('N', $now); // 1=Mon .. 7=Sun
 
@@ -215,7 +246,7 @@ class Rachio
 			if (empty($zone['enabled']) || empty($zone['auto_schedule'])) continue;
 			if ($override !== null && (int) $number !== $override) continue;
 			if (static::$recompute_schedule) return true;
-			if (ScheduleCache::read($number, date('Y-m-d')) === null) return true;
+			if (ScheduleCache::read($number, date('Y-m-d', Clock::now())) === null) return true;
 		}
 
 		return false;
@@ -236,6 +267,7 @@ class Rachio
 		$dry_run = false;
 		$zone    = null;
 		$recompute_schedule = false;
+		$now     = null;
 
 		$args = $_SERVER['argv'];
 		for ($i = 1; $i < count($args); $i++) {
@@ -248,10 +280,17 @@ class Rachio
 			} elseif ($args[$i] === '--zone' && isset($args[$i + 1])) {
 				$zone = (int) $args[$i + 1];
 				$i++;
+			} elseif (preg_match('/^--now=(.+)$/', $args[$i], $m)) {
+				$now = $m[1];
 			}
 		}
 
-		return ['dry_run' => $dry_run, 'zone' => $zone, 'recompute_schedule' => $recompute_schedule];
+		return [
+			'dry_run' => $dry_run,
+			'zone'    => $zone,
+			'recompute_schedule' => $recompute_schedule,
+			'now'     => $now,
+		];
 	}
 
 	private static function dueZones($override, $time, $dow)
@@ -579,7 +618,7 @@ class Rachio
 		}
 
 		$name = $zone['name'] ?? 'Zone';
-		$date = date('Y-m-d');
+		$date = date('Y-m-d', Clock::now());
 
 		if (static::$recompute_schedule && !static::$auto_schedule_built) {
 			@unlink(ScheduleCache::file($number, $date));
@@ -926,8 +965,12 @@ class Weather
 			return (int) Model::getTemperatureFull();
 		}
 
-		$key = date('Y-m-d');
+		$key = date('Y-m-d', Clock::now());
 		if (!isset(static::$data[$key]) || !isset(static::$data[$key][strtolower($basis)])) {
+			if (Clock::isOverridden()) {
+				echo sprintf('[weather] no temperature data for %s (--now outside forecast window) — using full temperature %dF', $key, Model::getTemperatureFull()) . PHP_EOL;
+				return (int) Model::getTemperatureFull();
+			}
 			throw new \RuntimeException('No temperature data for ' . $key);
 		}
 
@@ -941,7 +984,7 @@ class Weather
 			return (float) static::$et0_fallback;
 		}
 
-		$key = date('Y-m-d');
+		$key = date('Y-m-d', Clock::now());
 		$et0 = isset(static::$data[$key]['et0']) ? (float) static::$data[$key]['et0'] : 0;
 
 		if ($et0 <= 0) {
