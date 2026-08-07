@@ -17,10 +17,22 @@
  * - enabled        : required to run. Only zones with 'enabled' => true are
  *                    handled by this script; absent/false = disabled (e.g.
  *                    zones managed by the Rachio app)
+ * - auto_runtime   : compute runtime_basis automatically from the zone's
+ *                    advanced settings on the controller (available water ×
+ *                    root depth × allowed depletion ÷ nozzle rate ÷
+ *                    efficiency × 60), scaled by temperature like
+ *                    runtime_basis. Requires the controller's zone settings
+ *                    to be populated. Optional per-zone overrides for
+ *                    missing/zero values: 'available_water' (in/in),
+ *                    'root_depth' (in), 'allowed_depletion' (fraction),
+ *                    'nozzle_rate' (in/hr), 'efficiency' (fraction).
+ *                    Efficiency defaults to 1.0 (no loss) when absent; an
+ *                    explicit 0 is treated as bad input (zone skipped)
  * - runtime_basis : minutes per run at the full temperature (90F). Each
  *                   scheduled run gets this amount, scaled linearly from 0 at
  *                   the floor (55F) to 100% at the full temperature. Run a
  *                   zone 5 times a day and it gets that much water each time
+ *                   (ignored when auto_runtime is set)
  * - fixed_runtime : optional fixed minutes per run (bypasses temperature
  *                   model; ignores runtime_basis)
  * - max_runtime   : optional per-run cap in minutes
@@ -109,6 +121,19 @@ return [
 		//     'runtime_basis' => 0,
 		//     'times'         => [],
 		//     'days'          => null,
+		// ],
+
+		// 9 => [  // AUTO RUNTIME — compute basis from the controller's zone settings
+		//     'name'          => 'Zone 9 - Auto',
+		//     'enabled'       => true,
+		//     'auto_runtime'  => true,                // basis = water×depth×depletion ÷ nozzle ÷ efficiency × 60
+		//     // 'available_water' => 0.16,           // optional overrides if API values are missing/zero
+		//     // 'root_depth'      => 2,
+		//     // 'allowed_depletion' => 0.25,
+		//     // 'nozzle_rate'     => 1.57,
+		//     // 'efficiency'     => 0.8,             // defaults to 1.0 if absent; explicit 0 skips the zone
+		//     'times'         => ['07:00'],
+		//     'days'          => [1, 3, 5],
 		// ],
 	],
 ];

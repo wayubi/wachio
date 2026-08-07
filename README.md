@@ -115,6 +115,7 @@ Every option:
 - **`enabled`** — **required to run.** Only zones with `'enabled' => true` are handled by this script; absent or `false` disables the zone (e.g. a zone you manage through the Rachio app). Disabled zones are skipped even if they have `times` set, and `--zone N` overrides skip too.
 - **`times`** — required. Any number of `HH:MM` start times; the same set applies on every scheduled day. An empty array disables the zone.
 - **`days`** — optional. `null` = every day, or an array of weekdays where `1`=Mon … `7`=Sun.
+- **`auto_runtime`** — optional. When `true`, computes the zone's basis automatically from its advanced settings on the controller (`availableWater × rootZoneDepth × managementAllowedDepletion ÷ nozzleRate ÷ efficiency × 60`) instead of `runtime_basis`. The result is temperature-scaled exactly like `runtime_basis`. Optional per-zone overrides fill in missing/zero API values: `available_water` (in/in), `root_depth` (in), `allowed_depletion` (fraction), `nozzle_rate` (in/hr), `efficiency` (fraction). Efficiency behaves differently from the other four: a **missing** value defaults to `1.0` (no loss — the calc reduces to the plain formula), while an **explicit `0`** is treated as bad input and the zone is skipped. If any of the other required inputs can't be resolved, the zone is skipped with a message.
 - **`runtime_basis`** — the watering duration **per run** at the *full* temperature (`$temperature_full`, 90°F). Every scheduled run gets this amount, scaled linearly from `0` at the *floor* (`$temperature_floor`, 55°F) to 100% at the full temperature (see [Runtime model](#runtime-model)). A zone with `runtime_basis` 3 running 5 times a day gets ~3 minutes per run (≈15 min/day). Set to `0` (and/or empty `times`) to disable a zone.
 - **`fixed_runtime`** — optional. A fixed duration in minutes that **bypasses the temperature model entirely** and ignores `runtime_basis`. Use for a zone that must always run the same amount (e.g. `'fixed_runtime' => 1` = exactly 1 minute regardless of weather). Cannot be combined with a temperature-based basis — pick one.
 - **`max_runtime`** — optional. Caps a temperature-computed per-run duration in minutes. Not applied to `fixed_runtime` zones.
@@ -160,6 +161,11 @@ duration   = min(per_run, max_runtime)
 - The **floor** (55°F) means no watering at or below that temperature — this also supersedes a per-zone `min_temp` unless you want a stricter zone override. The **full** temperature (90°F) gives 100% of `runtime_basis`; hotter days plateau there rather than running longer.
 - **Example:** at 88°F, `factor = (88−55)/(90−55) = 0.94`, so a zone with `runtime_basis` 5 gets 4.7 min ≈ 283s **per run**.
 - **Per-run basis** — `runtime_basis` is a **per-run** amount, not a daily total. Each scheduled run gets the full scaled dose, so more runs/day means more total water (e.g. `runtime_basis` 3 × 5 runs/day ≈ 15 min/day at the full temperature).
+- **`auto_runtime`** — with `'auto_runtime' => true`, `runtime_basis` is replaced by a value computed from the zone's controller settings:
+  ```
+  basis = availableWater × rootZoneDepth × managementAllowedDepletion ÷ nozzleRate ÷ efficiency × 60
+  ```
+  i.e. the water depth per cycle (bucket size) divided by how fast the zone's nozzle applies it, corrected for irrigation efficiency — e.g. 0.16 × 2 × 0.25 = 0.08 in, at 1.57 in/hr with 0.8 efficiency → ~4 min (fixed spray), at 0.65 in/hr → ~9 min (rotary). The result is rounded to the nearest minute (min 1) and then temperature-scaled exactly like `runtime_basis`. A missing `efficiency` defaults to 1.0 (no correction); an explicit 0 skips the zone. See the zone options for the per-zone override keys.
 - **`fixed_runtime`** — zones with a `fixed_runtime` skip this whole model and use the fixed minutes directly.
 
 ## Rain & weather
