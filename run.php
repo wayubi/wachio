@@ -275,7 +275,28 @@ class Rachio
 			$eff = (float) $eff;
 		}
 
-		if ($water <= 0 || $depth <= 0 || $mad <= 0 || $rate <= 0 || $eff <= 0) {
+		$inputs  = [
+			'available_water'   => $water,
+			'root_depth'        => $depth,
+			'allowed_depletion' => $mad,
+			'nozzle_rate'       => $rate,
+			'efficiency'        => $eff,
+		];
+		$invalid = [];
+		$parts   = [];
+		foreach ($inputs as $label => $value) {
+			if ($value <= 0) {
+				$invalid[] = $label;
+				$parts[]   = $label . '=MISSING';
+			} else {
+				$parts[] = $label . '=' . $value;
+			}
+		}
+
+		$name = $zone['name'] ?? 'Zone';
+		if ($invalid) {
+			echo '[auto] ' . $name . ': ' . implode(', ', $parts)
+			     . ' → could not compute basis (invalid: ' . implode(', ', $invalid) . ')' . PHP_EOL;
 			return null;
 		}
 
@@ -284,7 +305,7 @@ class Rachio
 
 		echo sprintf(
 			'[auto] %s: %.2f in/in × %d in × %d%% ÷ %.2f in/hr ÷ %.2f eff → %dm basis',
-			$zone['name'] ?? 'Zone',
+			$name,
 			$water,
 			$depth,
 			(int) round($mad * 100),
@@ -351,12 +372,28 @@ class Rachio
 
 			if ($auto || !isset($zone['fixed_runtime'])) {
 				$per_run = (float) Model::getRunDose($basis_m, $temperature);
+				$factor  = $basis_m > 0 ? $per_run / $basis_m : 0;
+				$capped  = false;
 				if (isset($zone['max_runtime']) && $per_run > (int) $zone['max_runtime']) {
 					$per_run = (float) $zone['max_runtime'];
+					$capped  = true;
 				}
 				$duration = (int) round($per_run * 60);
+				echo sprintf(
+					'[basis] %s: %dm basis × temp %.2f @ %dF → %.1fm → %ds',
+					$zone['name'] ?? 'Zone',
+					$basis_m,
+					$factor,
+					$temperature,
+					$per_run,
+					$duration
+				) . PHP_EOL;
+				if ($capped) {
+					echo '[basis] ' . $zone['name'] . ': capped by max_runtime ' . $zone['max_runtime'] . 'm' . PHP_EOL;
+				}
 			} else {
 				$duration = $basis_m * 60;
+				echo '[basis] ' . $zone['name'] . ': fixed ' . $basis_m . 'm → ' . $duration . 's' . PHP_EOL;
 			}
 			if ($duration < 1) {
 				echo 'Skip ' . $zone['name'] . ': computed runtime is 0' . PHP_EOL;
