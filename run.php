@@ -300,21 +300,21 @@ class Rachio
 			return null;
 		}
 
-		$bucket  = $water * $depth * $mad;
-		$minutes = max(1, (int) round($bucket / $rate / $eff * 60));
+		$bucket = $water * $depth * $mad;
+		$basis  = $bucket / $rate / $eff * 60;
 
 		echo sprintf(
-			'[auto] %s: %.2f in/in × %d in × %d%% ÷ %.2f in/hr ÷ %.2f eff → %dm basis',
+			'[auto] %s: %.2f in/in × %d in × %d%% ÷ %.2f in/hr ÷ %.2f eff → %.2fm basis',
 			$name,
 			$water,
 			$depth,
 			(int) round($mad * 100),
 			$rate,
 			$eff,
-			$minutes
+			$basis
 		) . PHP_EOL;
 
-		return $minutes;
+		return $basis;
 	}
 
 	private static function buildZones($due, $device, $temperature)
@@ -329,7 +329,7 @@ class Rachio
 				echo 'Skip ' . $zone['name'] . ': not enabled in schedule' . PHP_EOL;
 				continue;
 			}
-			if (empty($zone['auto_runtime']) && !isset($zone['fixed_runtime']) && (int) ($zone['runtime_basis'] ?? 0) <= 0) {
+			if (empty($zone['auto_runtime']) && !isset($zone['fixed_runtime']) && (float) ($zone['runtime_basis'] ?? 0) <= 0) {
 				echo 'Skip ' . $zone['name'] . ': runtime_basis is 0' . PHP_EOL;
 				continue;
 			}
@@ -365,22 +365,22 @@ class Rachio
 				}
 				$auto = true;
 			} elseif (isset($zone['fixed_runtime'])) {
-				$basis_m = (int) $zone['fixed_runtime'];
+				$basis_m = (float) $zone['fixed_runtime'];
 			} else {
-				$basis_m = (int) $zone['runtime_basis'];
+				$basis_m = (float) $zone['runtime_basis'];
 			}
 
 			if ($auto || !isset($zone['fixed_runtime'])) {
 				$per_run = (float) Model::getRunDose($basis_m, $temperature);
 				$factor  = $basis_m > 0 ? $per_run / $basis_m : 0;
 				$capped  = false;
-				if (isset($zone['max_runtime']) && $per_run > (int) $zone['max_runtime']) {
+				if (isset($zone['max_runtime']) && $per_run > (float) $zone['max_runtime']) {
 					$per_run = (float) $zone['max_runtime'];
 					$capped  = true;
 				}
 				$duration = (int) round($per_run * 60);
 				echo sprintf(
-					'[basis] %s: %dm basis × temp %.2f @ %dF → %.1fm → %ds',
+					'[basis] %s: %.2fm basis × temp %.2f @ %dF → %.2fm → %ds',
 					$zone['name'] ?? 'Zone',
 					$basis_m,
 					$factor,
@@ -392,8 +392,8 @@ class Rachio
 					echo '[basis] ' . $zone['name'] . ': capped by max_runtime ' . $zone['max_runtime'] . 'm' . PHP_EOL;
 				}
 			} else {
-				$duration = $basis_m * 60;
-				echo '[basis] ' . $zone['name'] . ': fixed ' . $basis_m . 'm → ' . $duration . 's' . PHP_EOL;
+				$duration = (int) round($basis_m * 60);
+				echo '[basis] ' . $zone['name'] . ': fixed ' . round($basis_m, 2) . 'm → ' . $duration . 's' . PHP_EOL;
 			}
 			if ($duration < 1) {
 				echo 'Skip ' . $zone['name'] . ': computed runtime is 0' . PHP_EOL;
@@ -406,7 +406,7 @@ class Rachio
 				'sortOrder' => $sort_order++,
 			];
 
-			echo sprintf('Queue %s: %dm @ %dF → %ds', $zone['name'], $basis_m, $temperature, $duration) . PHP_EOL;
+			echo sprintf('Queue %s: %.2fm @ %dF → %ds', $zone['name'], $basis_m, $temperature, $duration) . PHP_EOL;
 		}
 
 		return $start_zones;

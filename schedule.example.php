@@ -32,10 +32,10 @@
  *                   scheduled run gets this amount, scaled linearly from 0 at
  *                   the floor (55F) to 100% at the full temperature. Run a
  *                   zone 5 times a day and it gets that much water each time
- *                   (ignored when auto_runtime is set)
+ *                   (ignored when auto_runtime is set). May be fractional
  * - fixed_runtime : optional fixed minutes per run (bypasses temperature
- *                   model; ignores runtime_basis)
- * - max_runtime   : optional per-run cap in minutes
+ *                   model; ignores runtime_basis). May be fractional
+ * - max_runtime   : optional per-run cap in minutes (may be fractional)
  * - min_temp      : optional F skip floor (do not water below this)
  * - schedules     : list of schedule blocks, each with:
  *     - times : list of HH:MM start times
