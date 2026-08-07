@@ -41,6 +41,22 @@
  *     - times : list of HH:MM start times
  *     - days  : optional weekdays 1-7 (1=Mon..7=Sun), or null for every day
  * - times / days : shorthand for a single schedule block
+ * - auto_schedule : compute run FREQUENCY from the zone's bucket size and
+ *                   reference evapotranspiration (ET0) instead of 'times'.
+ *                   Ignores 'times'/'days'. Requires 'window_start'. The crop
+ *                   coefficient (Kc) is read from the controller's customCrop
+ *                   (customCrop.coefficient); a missing/zero Kc skips the
+ *                   zone. Pairs with auto_runtime for a fully automatic zone,
+ *                   or with runtime_basis/fixed_runtime for automatic frequency
+ *                   + manual duration.
+ * - window_start : HH:MM of the first run of the day (required with
+ *                  auto_schedule); later runs are spaced by the interval
+ * - max_runs     : safety cap on runs (and split sub-cycles) per day
+ *                  (auto_schedule only; default 6)
+ * - max_cycle_minutes : single runs longer than this (min) are split into
+ *                  sub-cycles with soak gaps (default 10). Automatic for
+ *                  auto_schedule zones; manual zones are capped with a warning
+ * - soak_minutes : gap (min) between split sub-cycles (default 20)
  *
  * Set times to [] (and runtime_basis to 0) to disable a zone. Zone keys must
  * match the zone numbers reported by your controller.
@@ -134,6 +150,26 @@ return [
 		//     // 'efficiency'     => 0.8,             // defaults to 1.0 if absent; explicit 0 skips the zone
 		//     'times'         => ['07:00'],
 		//     'days'          => [1, 3, 5],
+		// ],
+
+		// 10 => [  // FULLY AUTOMATIC — auto_runtime (duration) + auto_schedule (frequency)
+		//     'name'             => 'Zone 10 - Fully Automatic',
+		//     'enabled'          => true,
+		//     'auto_runtime'     => true,             // duration from controller settings
+		//     'auto_schedule'    => true,             // frequency from bucket ÷ (Kc × ET0)
+		//     // Kc comes from the controller (customCrop.coefficient); no config needed
+		//     'window_start'     => '05:30',          // first run of the day (required)
+		//     'max_runs'         => 6,                // optional safety cap (default 6)
+		//     'max_cycle_minutes' => 10,              // optional cycle split threshold (default 10)
+		//     'soak_minutes'     => 20,               // optional soak gap (default 20)
+		// ],
+
+		// 11 => [  // AUTO FREQUENCY + MANUAL DURATION
+		//     'name'             => 'Zone 11 - Auto Freq, Fixed Time',
+		//     'enabled'          => true,
+		//     'runtime_basis'    => 8,                // manual duration, temperature-scaled
+		//     'auto_schedule'    => true,             // frequency computed from ET0
+		//     'window_start'     => '06:00',
 		// ],
 	],
 ];

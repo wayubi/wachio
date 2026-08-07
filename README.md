@@ -12,6 +12,8 @@ The controller's own scheduling is bypassed in favor of a configurable per-zone 
 - **Cold protection** — optional per-zone `min_temp` floor (no watering below a temperature).
 - **Safety caps** — optional per-zone `max_runtime`; verifies the controller is `IDLE` (via `getDeviceState`) right before starting, so manual/other zones are never interrupted.
 - **Fixed runtimes** — optional per-zone `fixed_runtime` for zones that must always run the same duration, bypassing temperature.
+- **Automatic frequency** (`auto_schedule`) — computes *how often* a zone should run from the same controller settings used by `auto_runtime` plus reference evapotranspiration (ET₀) and a crop coefficient, replacing the manual `times` array with a computed daily schedule.
+- **Cycle & soak** — runs that exceed `max_cycle_minutes` are split into shorter sub-runs with soak gaps (fully automatic for `auto_schedule` zones; capped with a warning for manually-scheduled ones).
 - **API-friendly** — no polling. When nothing is scheduled it exits before making any request (Rachio allows 3,500 req/day).
 - **Dry-run mode** — **on by default** (`'dry_run' => true` in `schedule.php`): the script prints exactly what it would send and never touches Rachio, until you flip it to `false`.
 
@@ -51,20 +53,24 @@ docker compose run --rm wachio php /app/run.php --dry-run
 # Force-preview one zone (still no watering)
 docker compose run --rm wachio php /app/run.php --dry-run --zone 4
 
+# Force-recompute an auto_schedule zone's daily schedule (debugging/testing)
+docker compose run --rm wachio php /app/run.php --dry-run --zone 4 --recompute-schedule
+
 # Force-preview one zone (still no watering, since 'dry_run' defaults to true)
 docker compose run --rm wachio php /app/run.php --zone 4
 ```
 
-> `--zone N` forces that single zone to run once, regardless of its schedule.
+> `--zone N` forces that single zone to run once, regardless of its schedule. For an `auto_schedule` zone run outside one of its scheduled times, the duration used is the **first entry** of that day's schedule — which, if the zone is cycle-split, may be a short sub-cycle rather than a full-length run.
+> `--recompute-schedule` discards today's cached `auto_schedule` run lists and rebuilds them from a fresh weather fetch (see [Auto schedule](#auto-schedule)). When combined with `--zone N`, only that zone is rebuilt.
 
 ## How it works
 
 The container runs BusyBox `crond` and executes `run.php` every minute. The script:
 
-1. Computes the local time from the configured timezone and checks which zones are **due** (`schedule.php` config only — no network calls).
+1. Computes the local time from the configured timezone and checks which zones are **due** (`schedule.php` config only, or the cached `auto_schedule` run list — no network calls, *except* the first tick of a day when an `auto_schedule` zone's schedule hasn't been computed yet, which fetches the controller and forecast once to build it).
 2. If nothing is due, it prints `Nothing scheduled` and exits immediately.
 3. Otherwise it fetches the controller (person → device) and checks for an active rain delay.
-4. Pulls the forecast from [Open-Meteo](https://open-meteo.com) (free, no API key) using the controller's latitude/longitude. Transient failures (429/5xx) are retried; if the forecast is still unavailable it falls back to a cached copy from the last 12 hours, or runs at full temperature (see [Rain & weather](#rain--weather)).
+4. Pulls the forecast from [Open-Meteo](https://open-meteo.com) (free, no API key) using the controller's latitude/longitude. Transient failures (429/5xx) are retried; if the forecast is still unavailable it falls back to a cached copy from the last 12 hours, or runs at full temperature (see [Rain & weather](#rain--weather)). The forecast also provides daily reference evapotranspiration (ET₀), used by `auto_schedule` zones.
 5. Skips if rain is forecast within the check window, or a zone's temperature is below its `min_temp`.
 6. Computes each due zone's runtime, then — immediately before calling `start_multiple` — checks the controller's live state via `getDeviceState`; if it's anything but `IDLE` (e.g. a manual zone is running), it aborts and leaves it alone.
 7. Calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `'dry_run'`), in which case it prints the would-be payload and exits. Same-tick zones are batched into that one call and run sequentially by `sortOrder`.
@@ -121,6 +127,11 @@ Every option:
 - **`max_runtime`** — optional. Caps a temperature-computed per-run duration in minutes. May be fractional (e.g. `3.5`). Not applied to `fixed_runtime` zones.
 - **`min_temp`** — optional. Skips the zone when the day's temperature is below this value (°F). Useful to avoid watering near freezing.
 - **`schedules`** — optional. A list of schedule blocks, each with its own `times` and `days`, for multiple distinct schedules on one zone (see below). Mutually exclusive with the flat `times`/`days` shorthand.
+- **`auto_schedule`** — optional. When `true`, ignores `times`/`days` and computes the zone's daily run times from its bucket size and evapotranspiration instead (see [Auto schedule](#auto-schedule)). Requires `window_start`. The crop coefficient (Kc) is read from the controller's `customCrop.coefficient`; no zone-config value is needed. Independent of the duration source: combine with `auto_runtime` for a fully automatic zone, or with `runtime_basis`/`fixed_runtime` for automatic frequency with a manual duration.
+- **`window_start`** — required when `auto_schedule` is set. `HH:MM` time of the zone's first run of the day (e.g. `'05:30'`). Subsequent runs are spaced by the computed interval.
+- **`max_runs`** — optional. Safety cap on the number of scheduled runs (and split sub-cycles) per day for an `auto_schedule` zone. Default `6`.
+- **`max_cycle_minutes`** — optional. Any single run longer than this (minutes) is split into shorter sub-cycles with soak gaps. Default `10`. For `auto_schedule` zones the split is automatic (each sub-cycle becomes its own scheduled run, spaced by run duration + soak); for manually-scheduled zones a run over the cap is **capped with a warning** instead of split (see [Cycle & soak](#cycle--soak)).
+- **`soak_minutes`** — optional. Gap (minutes) between split sub-cycles. Default `20`.
 
 #### Multiple schedules per zone
 
@@ -168,9 +179,36 @@ duration   = min(per_run, max_runtime)
   i.e. the water depth per cycle (bucket size) divided by how fast the zone's nozzle applies it, corrected for irrigation efficiency — e.g. 0.16 × 2 × 0.25 = 0.08 in, at 1.57 in/hr with 0.8 efficiency → ~3.82 min basis (fixed spray), at 0.65 in/hr → ~8.57 min (rotary). The basis stays a float (minutes); the only rounding is to whole seconds when the run duration is sent to the controller. A missing `efficiency` defaults to 1.0 (no correction); an explicit 0 skips the zone. See the zone options for the per-zone override keys.
 - **`fixed_runtime`** — zones with a `fixed_runtime` skip this whole model and use the fixed minutes directly.
 
+## Auto schedule
+
+`auto_runtime` answers "how long should one watering event run?" `auto_schedule` answers the other half: **"how often should it run?"** It replaces a zone's static `times` array with a schedule computed once per day from the same bucket inputs and reference evapotranspiration (ET₀):
+
+```
+bucket      = availableWater × rootZoneDepth × managementAllowedDepletion   (inches)
+daily_loss  = cropCoefficient × ET₀                                        (inches/day)
+interval_hr = (bucket ÷ daily_loss) × 24
+```
+
+The bucket is the water depth applied per cycle (identical to the `auto_runtime` basis' numerator). ET₀ is today's reference evapotranspiration from the Open-Meteo forecast; `cropCoefficient` (Kc) scales it to the actual crop's water use, so the interval is the time it takes the bucket to drain. The interval is clamped to a minimum of 0.5 h.
+
+- **Example:** bucket 0.08 in, Kc 0.65, ET₀ 0.21 in/day → daily loss 0.137 in/day → interval ≈ **14.1 h** → from a `05:30` window start the zone runs at 05:30 and 19:34.
+- Run times start at `window_start` and are spaced by `interval_hr`, stopping at midnight or `max_runs` (default 6), rounded to the nearest minute. Zones water every day — there is no per-week `days` concept for `auto_schedule`.
+- Durations are frozen at schedule-build time: temperature scaling, `max_runtime`, and cycle-splitting are all applied when the day's schedule is computed (using that morning's forecast temperature), so a hot afternoon won't lengthen that afternoon's run. This is what keeps split sub-cycles consistent within a day.
+- **Daily caching** — the computed run list is written to `/tmp/wachio_schedule_<zone>_<date>.json` and reused by every cron tick that day, so a mid-day forecast change can't shift the run times. The first tick of a day that needs a schedule does the real computation (one controller + one weather fetch); stale caches older than 2 days are cleaned up on each run. `--recompute-schedule` forces a rebuild for testing (all auto_schedule zones, or just `--zone N` when both flags are passed).
+- **ET₀ units** — Open-Meteo returns `et0_fao_evapotranspiration` in **millimeters** by default; the script requests it in **inches** (`precipitation_unit=inch`) and also converts `mm → in` (÷ 25.4) defensively if the response reports mm. The value shown in the `[interval]` log line is already in inches/day.
+- **Missing ET₀** — if the forecast is unavailable or today's ET₀ is missing/≤0, a conservative fallback of **0.20 in/day** is used and logged (`[weather] no ET0 for today — using fallback 0.20 in/day`), so a weather outage can't crash the run.
+- **Validation** — if `auto_schedule` is set but `window_start` is missing, the controller reports no crop coefficient (`customCrop.coefficient` missing/0), or the bucket inputs can't be resolved, the zone is skipped with a clear `[interval]`/`[schedule]` message, and an empty result is cached so the message is logged once per day rather than every minute.
+
+## Cycle & soak
+
+Rachio's `start_multiple` API takes one duration per zone and has no native cycle-and-soak support, so splitting is emulated at the schedule layer: a run longer than `max_cycle_minutes` is broken into roughly-equal sub-cycles (each ≤ the cap), and each sub-cycle becomes its own scheduled run time spaced by *run duration + `soak_minutes`*.
+
+- **`auto_schedule` zones — fully automatic.** Splitting happens when the day's schedule is built, so the cached run list already contains the sub-cycles as distinct entries (each carrying its explicit sub-cycle duration), and each fires its own API call via a normal cron tick.
+- **Manually-scheduled zones (static `times`)** — the schedule is user-authored, so the script cannot inject extra run times without violating your `times`. Instead, a run that would exceed `max_cycle_minutes` is **capped at the cap and logged** (`[cycle] ... capping run`), accepting possible under-delivery that day. If a manual zone regularly needs splitting, convert it to `auto_schedule`, or author multiple `times` entries yourself with a smaller `runtime_basis`/`fixed_runtime`.
+
 ## Rain & weather
 
-- **Source:** [Open-Meteo](https://open-meteo.com) forecast for the controller's coordinates — free, no account or key needed.
+- **Source:** [Open-Meteo](https://open-meteo.com) forecast for the controller's coordinates — free, no account or key needed. Also supplies daily reference evapotranspiration (ET₀) for `auto_schedule` zones (requested in inches; see [Auto schedule](#auto-schedule)).
 - **Rain skip:** watering is skipped if precipitation probability exceeds 50% on any day within `rain_check_days` (default 2).
 - **Rain delay:** if a rain delay is active on the controller (`rainDelayExpirationDate`), watering is skipped.
 - **Resilience:** every successful forecast is cached to `/tmp/wachio_weather.json` (with a timestamp). Transient Open-Meteo failures (HTTP 429/500/502/503/504) are retried up to 3× with short backoff. If the forecast is still unavailable, the script uses the cached copy when it's **≤12h old** (rain check and temperature scaling still apply); otherwise it waters at **full dose** — the temperature model is treated as at the full temperature (no rain check, since no forecast is available). This means a temporary weather outage never causes a missed watering, and never crashes the tick.
@@ -192,6 +230,7 @@ crontab               Runs `php /app/run.php` every minute
 - **`RACHIO_TOKEN environment variable is not set`** — add your token to `compose.override.yml` (or set `RACHIO_TOKEN` in your environment) and recreate the container: `docker compose up -d`.
 - **`HTTP 401 ... The client is not authorized`** — the token is wrong or was revoked.
 - **Nothing ever waters** — check your `days`/`times` against the configured `$timezone`, and the zone numbers against your controller. Use `--dry-run` to see what the script is deciding.
+- **An `auto_schedule` zone never runs** — check the `[interval]`/`[schedule]` log lines: the zone is skipped if `window_start` is missing, the controller reports no crop coefficient (`customCrop.coefficient` missing/0), or its bucket inputs (available water / root depth / allowed depletion) can't be resolved. If you fix the config mid-day, run `--recompute-schedule` (optionally scoped to a zone with `--zone N`) to rebuild today's schedule (the cached empty result otherwise lasts until the next day).
 - **It only ever dry-runs** — `'dry_run'` defaults to `true`; flip it to `false` (in `schedule.php`) to actually send requests to Rachio.
 - **`start_multiple` rejects the payload** — see the note below.
 
