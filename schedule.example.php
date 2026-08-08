@@ -12,6 +12,13 @@
  * - dry_run : true = compute and print what would be sent, never touch Rachio.
  *             Set to false to actually water.
  *
+ * CLI flags (run.php):
+ *
+ * - --simulate-busy : test-only. Forces the controller state check to report
+ *                     "WATERING" so the collision/queue path can be exercised
+ *                     in dry-run. Nothing can ever be sent while it's active.
+ *                     See README "Collision handling".
+ *
  * Zone options:
  *
  * - enabled        : required to run. Only zones with 'enabled' => true are

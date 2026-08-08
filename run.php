@@ -90,6 +90,23 @@ class Rachio
 	private static $recompute_schedule = false; // forced by --recompute-schedule
 	private static $auto_schedule_built = false; // true once today's caches are (re)built this process
 
+	// How long a queued run is allowed to wait for the controller before it is
+	// dropped rather than retried (real elapsed time, see PendingQueue).
+	private const PENDING_MAX_AGE_S = 15 * 60;
+
+	// Test-only override for getDeviceState (set by --simulate-busy).
+	private static $device_state_override = null;
+
+	public static function setDeviceStateOverride($state)
+	{
+		static::$device_state_override = $state;
+	}
+
+	public static function clearDeviceStateOverride()
+	{
+		static::$device_state_override = null;
+	}
+
 	/**
 	 * Loads the schedule (timezone, dry_run + zones) from schedule.php, falling
 	 * back to schedule.example.php if it is missing. See schedule.example.php
@@ -110,6 +127,11 @@ class Rachio
 	public static function run()
 	{
 		$options = static::parseArgs();
+
+		if ($options['simulate_busy']) {
+			static::setDeviceStateOverride('WATERING');
+			echo '[simulate-busy] forcing controller state WATERING — nothing will be sent' . PHP_EOL;
+		}
 
 		$lock = @fopen('/tmp/wachio.lock', 'c');
 		if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
@@ -143,6 +165,17 @@ class Rachio
 
 		ScheduleCache::cleanup();
 
+		foreach (PendingQueue::prune() as $expired) {
+			$pz    = (int) $expired['zone'];
+			$pname = static::$zones[$pz]['name'] ?? ('Zone ' . $pz);
+			echo sprintf(
+				'[pending] %s: queued run for %s expired unfired after %ds — controller never became idle in time',
+				$pname,
+				$expired['due_time'],
+				static::PENDING_MAX_AGE_S
+			) . PHP_EOL;
+		}
+
 		if (static::needsAutoScheduleBuild($options['zone'])) {
 			if (empty($api_token)) {
 				fwrite(STDERR, 'RACHIO_TOKEN environment variable is not set' . PHP_EOL);
@@ -155,7 +188,8 @@ class Rachio
 
 		$due = static::dueZones($options['zone'], $now_time, $dow);
 
-		if (empty($due)) {
+		$has_pending = !empty(PendingQueue::read());
+		if (empty($due) && !$has_pending) {
 			echo sprintf('[%s] Nothing scheduled', $now_time) . PHP_EOL;
 			exit(0);
 		}
@@ -196,6 +230,7 @@ class Rachio
 			$temperature       = (int) Weather::getTemperature($temperature_basis);
 
 			$start_zones = static::buildZones($due, $device, $temperature, $now_time, $options['zone']);
+			$start_zones = static::mergePending($start_zones, $device);
 
 			if (empty($start_zones)) {
 				echo '=== No zones to water ===' . PHP_EOL;
@@ -205,20 +240,35 @@ class Rachio
 			$payload = json_encode(['zones' => $start_zones]);
 
 			$dry_run = static::$dry_run || $options['dry_run'];
-			if ($dry_run) {
-				echo sprintf('[dry-run] temperature(%s) = %dF', $temperature_basis, $temperature) . PHP_EOL;
-				echo '[dry-run] would PUT ' . $payload . PHP_EOL;
+
+			$state = null;
+			if (static::$device_state_override !== null || !$dry_run) {
+				$state = static::deviceState($device_id, $headers);
+				echo '[status] controller state: ' . $state . PHP_EOL;
+			}
+			if ($state === null) {
+				$state = 'IDLE'; // dry-run with no override — controller not checked
+			}
+
+			if ($state !== 'IDLE') {
+				echo '=== Controller busy — queuing ' . count($start_zones) . ' zone(s) for retry ===' . PHP_EOL;
+				static::queueZones($start_zones, $now_time);
 				exit(0);
 			}
 
-			$state = static::deviceState($device_id, $headers);
-			echo '[status] controller state: ' . $state . PHP_EOL;
-			if ($state !== 'IDLE') {
-				echo '=== Stopping: controller is not idle (a zone may be running) ===' . PHP_EOL;
+			if ($dry_run) {
+				echo sprintf('[dry-run] temperature(%s) = %dF', $temperature_basis, $temperature) . PHP_EOL;
+				echo '[dry-run] would PUT ' . $payload . PHP_EOL;
+				foreach ($start_zones as $z) {
+					PendingQueue::remove((int) $z['zone_number']);
+				}
 				exit(0);
 			}
 
 			Curl::request('https://api.rach.io/1/public/zone/start_multiple', $headers, 'PUT', $payload);
+			foreach ($start_zones as $z) {
+				PendingQueue::remove((int) $z['zone_number']);
+			}
 			echo '=== Done: Lawn Watered ===' . PHP_EOL;
 		} catch (\RuntimeException $e) {
 			fwrite(STDERR, 'Error: ' . $e->getMessage() . PHP_EOL);
@@ -268,6 +318,7 @@ class Rachio
 		$zone    = null;
 		$recompute_schedule = false;
 		$now     = null;
+		$simulate_busy = false;
 
 		$args = $_SERVER['argv'];
 		for ($i = 1; $i < count($args); $i++) {
@@ -275,6 +326,8 @@ class Rachio
 				$dry_run = true;
 			} elseif ($args[$i] === '--recompute-schedule') {
 				$recompute_schedule = true;
+			} elseif ($args[$i] === '--simulate-busy') {
+				$simulate_busy = true;
 			} elseif (preg_match('/^--zone=(\d+)$/', $args[$i], $m)) {
 				$zone = (int) $m[1];
 			} elseif ($args[$i] === '--zone' && isset($args[$i + 1])) {
@@ -290,6 +343,7 @@ class Rachio
 			'zone'    => $zone,
 			'recompute_schedule' => $recompute_schedule,
 			'now'     => $now,
+			'simulate_busy' => $simulate_busy,
 		];
 	}
 
@@ -359,6 +413,10 @@ class Rachio
 
 	private static function deviceState($device_id, $headers)
 	{
+		if (static::$device_state_override !== null) {
+			return static::$device_state_override;
+		}
+
 		$result = Curl::request('https://cloud-rest.rach.io/device/getDeviceState/' . $device_id, $headers);
 		$state  = $result->state->state ?? $result->state ?? null;
 		if (!is_string($state)) {
@@ -993,9 +1051,10 @@ class Rachio
 				}
 
 				$start_zones[] = [
-					'id'        => (string) $device_zone->id,
-					'duration'  => $duration,
-					'sortOrder' => $sort_order++,
+					'id'          => (string) $device_zone->id,
+					'duration'    => $duration,
+					'sortOrder'   => $sort_order++,
+					'zone_number' => (int) $number,
 				];
 				echo sprintf('Queue %s: scheduled run → %ds', $zone['name'], $duration) . PHP_EOL;
 				continue;
@@ -1054,15 +1113,101 @@ class Rachio
 			}
 
 			$start_zones[] = [
-				'id'        => (string) $device_zone->id,
-				'duration'  => $duration,
-				'sortOrder' => $sort_order++,
+				'id'          => (string) $device_zone->id,
+				'duration'    => $duration,
+				'sortOrder'   => $sort_order++,
+				'zone_number' => (int) $number,
 			];
 
 			echo sprintf('Queue %s: %.2fm @ %dF → %ds', $zone['name'], $basis_m, $temperature, $duration) . PHP_EOL;
 		}
 
 		return $start_zones;
+	}
+
+	/**
+	 * Appends this tick's pending (previously-queued) runs to the batch, using
+	 * each entry's FROZEN duration — never recomputed. Freshly-due zones keep
+	 * their place (on schedule); retried pending runs are appended after them
+	 * and sortOrder is renumbered 1..n. A pending entry whose zone was since
+	 * disabled or removed is dropped with a warning; a zone that is both
+	 * freshly-due and pending is kept once (the older pending run wins, the
+	 * fresh occurrence is dropped) so the same zone can never appear twice in
+	 * one start_multiple call.
+	 */
+	private static function mergePending(array $start_zones, $device)
+	{
+		$pending = PendingQueue::read();
+		if (empty($pending)) {
+			return $start_zones;
+		}
+
+		$have = [];
+		foreach ($start_zones as $k => $z) {
+			$have[(int) $z['zone_number']] = $k;
+		}
+
+		foreach ($pending as $entry) {
+			$number = (int) $entry['zone'];
+			$zone   = static::$zones[$number] ?? null;
+
+			if ($zone === null || empty($zone['enabled'])) {
+				echo sprintf('[pending] Zone %d: queued run dropped — zone disabled or removed from schedule', $number) . PHP_EOL;
+				PendingQueue::remove($number);
+				continue;
+			}
+
+			$device_zone = static::deviceZoneFor($device, $number);
+			if ($device_zone === null || !$device_zone->enabled) {
+				echo sprintf('[pending] %s: queued run dropped — zone not enabled on device', $zone['name'] ?? 'Zone') . PHP_EOL;
+				PendingQueue::remove($number);
+				continue;
+			}
+
+			if (isset($have[$number])) {
+				// The zone is both freshly-due and pending: keep the older pending
+				// run and drop the fresh occurrence so the zone is never watered
+				// twice from one tick.
+				echo sprintf('[pending] %s: already queued — skipping newly-due occurrence', $zone['name'] ?? 'Zone') . PHP_EOL;
+				unset($start_zones[$have[$number]]);
+			}
+
+			$start_zones[] = [
+				'id'          => (string) $device_zone->id,
+				'duration'    => (int) $entry['duration'],
+				'sortOrder'   => count($start_zones) + 1,
+				'zone_number' => $number,
+			];
+			$have[$number] = true;
+			echo sprintf(
+				'[pending] %s: retrying queued run (originally %s, %ds)',
+				$zone['name'] ?? 'Zone',
+				$entry['due_time'],
+				$entry['duration']
+			) . PHP_EOL;
+		}
+
+		$start_zones = array_values($start_zones);
+		foreach ($start_zones as $i => $z) {
+			$start_zones[$i]['sortOrder'] = $i + 1;
+		}
+
+		return $start_zones;
+	}
+
+	/** Queues every zone in the batch for retry; already-pending zones are left alone (expiry is not refreshed). */
+	private static function queueZones(array $start_zones, $now_time)
+	{
+		foreach ($start_zones as $z) {
+			$number = (int) $z['zone_number'];
+			$name   = static::$zones[$number]['name'] ?? ('Zone ' . $number);
+			$added  = PendingQueue::add($number, (int) $z['duration'], $now_time, time() + static::PENDING_MAX_AGE_S);
+			if ($added) {
+				echo sprintf('[pending] %s: queued %ds run (was due %s) for retry', $name, $z['duration'], $now_time) . PHP_EOL;
+			} else {
+				echo sprintf('[pending] %s: already queued — continuing to wait', $name) . PHP_EOL;
+			}
+		}
 	}
 }
 
@@ -1362,6 +1507,104 @@ class ScheduleCache
 				@unlink($file);
 			}
 		}
+	}
+}
+
+class PendingQueue
+{
+	/**
+	 * Persistent queue of runs that were due but had to wait because the
+	 * controller was busy (getDeviceState != IDLE). One entry per zone.
+	 * Schema: { "entries": [ { "zone": int, "duration": int, "queued_at": int,
+	 *           "due_time": "HH:MM", "expires_at": int } ] }
+	 *
+	 * queued_at/expires_at use REAL time (not Clock::now()) — expiry is about
+	 * real elapsed wall-clock time waiting for the controller, not simulated
+	 * schedule time.
+	 */
+	private const FILE = '/tmp/wachio_pending.json';
+
+	public static function read()
+	{
+		$raw = @file_get_contents(self::FILE);
+		$j   = json_decode($raw === false ? '' : $raw, true);
+		if (!is_array($j) || !isset($j['entries']) || !is_array($j['entries'])) {
+			return [];
+		}
+
+		return $j['entries'];
+	}
+
+	public static function write(array $entries)
+	{
+		@file_put_contents(self::FILE, json_encode(['entries' => $entries]));
+	}
+
+	public static function has($zone)
+	{
+		foreach (self::read() as $entry) {
+			if ((int) $entry['zone'] === (int) $zone) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** Adds a pending entry; returns false if the zone already has one queued. */
+	public static function add($zone, $duration, $due_time, $expires_at)
+	{
+		if (self::has($zone)) {
+			return false;
+		}
+
+		$entries   = self::read();
+		$entries[] = [
+			'zone'       => (int) $zone,
+			'duration'   => (int) $duration,
+			'queued_at'  => time(),
+			'due_time'   => (string) $due_time,
+			'expires_at' => (int) $expires_at,
+		];
+		self::write($entries);
+
+		return true;
+	}
+
+	/** Removes every pending entry for a zone (one per zone, so ≤ 1). */
+	public static function remove($zone)
+	{
+		$entries = self::read();
+		$kept    = [];
+		foreach ($entries as $entry) {
+			if ((int) $entry['zone'] !== (int) $zone) {
+				$kept[] = $entry;
+			}
+		}
+		self::write($kept);
+	}
+
+	/** Drops expired entries (real time) and returns them for logging. */
+	public static function prune()
+	{
+		$entries = self::read();
+		$now     = time();
+
+		$kept    = [];
+		$expired = [];
+		foreach ($entries as $entry) {
+			if ((int) $entry['expires_at'] <= $now) {
+				$expired[] = $entry;
+			} else {
+				$kept[] = $entry;
+			}
+		}
+
+		if ($expired) {
+			self::write($kept);
+		}
+
+		return $expired;
 	}
 }
 

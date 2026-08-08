@@ -75,12 +75,13 @@ docker compose run --rm wachio php /app/run.php --zone 4
 The container runs BusyBox `crond` and executes `run.php` every minute. The script:
 
 1. Computes the local time from the configured timezone and checks which zones are **due** (`schedule.php` config only, or the cached `auto_schedule` run list — no network calls, *except* the first tick of a day when an `auto_schedule` zone's schedule hasn't been computed yet, which fetches the controller and forecast once to build it).
-2. If nothing is due, it prints `Nothing scheduled` and exits immediately.
+2. If nothing is due **and nothing is queued for retry** (see [Collision handling](#collision-handling)), it prints `Nothing scheduled` and exits immediately.
 3. Otherwise it fetches the controller (person → device) and checks for an active rain delay.
 4. Pulls the forecast from [Open-Meteo](https://open-meteo.com) (free, no API key) using the controller's latitude/longitude. Transient failures (429/5xx) are retried; if the forecast is still unavailable it falls back to a cached copy from the last 12 hours, or runs at full temperature (see [Rain & weather](#rain--weather)). The forecast also provides daily reference evapotranspiration (ET₀), used by `auto_schedule` zones.
 5. Skips if rain is forecast within the check window, or a zone's temperature is below its `min_temp`.
-6. Computes each due zone's runtime, then — immediately before calling `start_multiple` — checks the controller's live state via `getDeviceState`; if it's anything but `IDLE` (e.g. a manual zone is running), it aborts and leaves it alone.
-7. Calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `'dry_run'`), in which case it prints the would-be payload and exits. Same-tick zones are batched into that one call and run sequentially by `sortOrder`.
+6. Computes each due zone's runtime and checks the controller's live state via `getDeviceState` immediately before calling `start_multiple`. (In dry-run this check is skipped — no unnecessary API call — unless `--simulate-busy` is set.)
+7. If the controller is anything but `IDLE` (e.g. a manual zone is running), the due zones are **queued for retry** instead of lost — never a second overlapping `start_multiple` (see [Collision handling](#collision-handling)).
+8. Retries any queued runs from earlier ticks (using their frozen durations), then calls `PUT /public/zone/start_multiple` — **unless** dry-run is active (see `'dry_run'`), in which case it prints the would-be payload. Same-tick zones (fresh and retried together) are batched into that one call and run sequentially by `sortOrder`.
 
 ## Configuration
 
@@ -245,6 +246,19 @@ Rachio's `start_multiple` API takes one duration per zone and has no native cycl
 
 - **`auto_schedule` zones — fully automatic.** Splitting happens when the day's schedule is built, so the cached run list already contains the sub-cycles as distinct entries (each carrying its explicit sub-cycle duration), and each fires its own API call via a normal cron tick.
 - **Manually-scheduled zones (static `times`)** — the schedule is user-authored, so the script cannot inject extra run times without violating your `times`. Instead, a run that would exceed `max_cycle_minutes` is **capped at the cap and logged** (`[cycle] ... capping run`), accepting possible under-delivery that day. If a manual zone regularly needs splitting, convert it to `auto_schedule`, or author multiple `times` entries yourself with a smaller `runtime_basis`/`fixed_runtime`.
+
+## Collision handling
+
+Each cron tick is a short-lived process that identifies due zones, sends one `start_multiple` PUT, and exits — it never waits for the physical watering to finish. A collision (two overlapping `start_multiple` calls) **can't** happen, because the tick checks `getDeviceState` immediately before sending and refuses to send if the controller isn't `IDLE`. Without this feature, though, that refusal meant the tick's runs were **silently lost for the day** — no retry, no catch-up. With solar-anchored and fixed-clock zones, run times can drift into alignment over the season, making a lost run a real risk.
+
+Instead of skipping, the tick now **queues for retry**:
+
+- **Busy → queued.** When the controller reports anything but `IDLE`, every zone that was about to be sent is written to `/tmp/wachio_pending.json` (zone, frozen duration, original due time, and an expiry timestamp) and logged: `[pending] Zone 4: queued 250s run (was due 05:30) for retry`.
+- **Retried every subsequent tick.** Each tick starts by dropping expired entries (`PendingQueue::prune`) and then merges any remaining queued runs into the batch alongside freshly-due zones — they pass through the same `getDeviceState` check, so a still-busy controller simply keeps them queued. A retried run uses its **frozen** duration (exactly what was computed at its original due time — never recomputed), so it delivers the same water the equation originally decided on.
+- **Expiry (default 15 min).** A queued run waits at most `PENDING_MAX_AGE_S` for the controller to free up. If it expires, it's logged and dropped — `[pending] Zone 4: queued run for 05:30 expired unfired after 900s — controller never became idle in time` — never fired late. An occasional lost run from a genuinely stuck controller is an acceptable, visible failure; firing hours late is worse.
+- **One entry per zone.** If a zone is already queued and becomes due again, the newer occurrence is dropped with a warning (`already queued — skipping newly-due occurrence`) rather than stacking, so a zone can never be watered twice from queue pile-up. The pending entry that's removed only after a successful send (or dry-run would-send).
+- **`/tmp` lifecycle.** The queue lives in `/tmp` like the schedule and weather caches, so a container recreate wipes it along with everything else — no stale entries survive pointing at zone numbers that may have changed in `schedule.php`.
+- **`--simulate-busy` (testing).** Forces `getDeviceState` to report `WATERING` so the queue path can be exercised end-to-end. Because the state is never `IDLE`, nothing can ever be sent while it's active — it's safe even in real mode. In dry-run without it, the state check is skipped entirely (no unnecessary API call) and the tick proceeds as if idle, so `--simulate-busy` is the only way dry-run shows the busy/queue decision.
 
 ## Rain & weather
 
