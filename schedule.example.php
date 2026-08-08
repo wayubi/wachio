@@ -49,14 +49,22 @@
  *                   zone. Pairs with auto_runtime for a fully automatic zone,
  *                   or with runtime_basis/fixed_runtime for automatic frequency
  *                   + manual duration.
- * - window_start : HH:MM of the first run of the day (required with
- *                  auto_schedule); later runs are spaced by the interval
- * - window_end   : optional HH:MM of the last run of the day. When set, the
- *                  equation-determined run count is preserved but the runs are
- *                  compressed evenly into the window_start-window_end span
- *                  instead of spilling toward midnight. Must be later than
- *                  window_start. Does not change total daily water (unless
- *                  max_runs caps the count, which reduces water accordingly).
+ * - window_start : first run of the day (required with auto_schedule), as
+ *                  HH:MM or a solar keyword: 'sunrise'/'sunset' with an optional
+ *                  minute offset ('sunrise+30', 'sunset-60'). Solar resolves
+ *                  against the day's forecast (fallback default 06:00 with a
+ *                  warning if unavailable). Later runs are spaced by the interval
+ * - window_end   : optional last run of the day, HH:MM or solar keyword (fallback
+ *                  default 19:00). When set, the equation-determined run count is
+ *                  preserved but the runs are placed within the
+ *                  window_start-window_end span instead of spilling toward
+ *                  midnight. Must be later than window_start. Does not change
+ *                  total daily water (unless max_runs caps the count, which
+ *                  reduces water accordingly).
+ * - placement_curve : optional placement within a window_end span: 'uniform'
+ *                  (default, even spacing) or 'bell' (invert the hourly ET0
+ *                  curve so runs cluster in peak-evapotranspiration hours).
+ *                  Unknown values warn and fall back to 'uniform'.
  * - max_runs     : safety cap on runs (and split sub-cycles) per day
  *                  (auto_schedule only; default 6)
  * - max_cycle_minutes : single runs longer than this (min) are split into
@@ -164,9 +172,14 @@ return [
 		//     'auto_runtime'     => true,             // duration from controller settings
 		//     'auto_schedule'    => true,             // frequency from bucket ÷ (Kc × ET0)
 		//     // Kc comes from the controller (customCrop.coefficient); no config needed
-		//     'window_start'     => '05:30',          // first run of the day (required)
-		//     'window_end'       => '19:00',          // optional: keep runs within daylight
-		//                                            // hours (germination/seedbed zones)
+		//     'window_start'     => 'sunrise',        // first run of the day (required)
+		//                                            // solar keywords: 'sunrise', 'sunset',
+		//                                            // 'sunrise+30', 'sunset-60', or HH:MM
+		//     'window_end'       => 'sunset-60',      // optional: keep runs within daylight
+		//                                            // hours; falls back to 19:00 if the
+		//                                            // forecast lacks solar data
+		//     'placement_curve'  => 'bell',           // optional: 'uniform' (default) or
+		//                                            // 'bell' to cluster runs in peak-ET hours
 		//     'max_runs'         => 6,                // optional safety cap (default 6)
 		//     'max_cycle_minutes' => 10,              // optional cycle split threshold (default 10)
 		//     'soak_minutes'     => 20,               // optional soak gap (default 20)

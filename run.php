@@ -149,7 +149,7 @@ class Rachio
 				exit(1);
 			}
 			static::$device = static::fetchDevice($api_token);
-			Weather::request((float) static::$device->latitude, (float) static::$device->longitude, static::$timezone);
+			Weather::request((float) static::$device->latitude, (float) static::$device->longitude, static::$timezone, static::anyZoneUsesBell());
 			static::buildAutoScheduleCaches($options['zone']);
 		}
 
@@ -184,7 +184,7 @@ class Rachio
 			}
 
 			if (!Weather::isLoaded()) {
-				Weather::request((float) $device->latitude, (float) $device->longitude, static::$timezone);
+				Weather::request((float) $device->latitude, (float) $device->longitude, static::$timezone, static::anyZoneUsesBell());
 			}
 
 			if (Weather::rainForecast()) {
@@ -537,13 +537,170 @@ class Rachio
 		return sprintf('%02d:%02d', (int) floor($minutes / 60), $minutes % 60);
 	}
 
+	/**
+	 * Resolves a window boundary (window_start/window_end) to minutes-from-midnight.
+	 * Accepts 'HH:MM' or solar keywords 'sunrise'/'sunset' with an optional
+	 * minute offset ('sunrise+30', 'sunset-90'). Solar keywords resolve against
+	 * today's forecast sunrise/sunset; when unavailable, $default_min is used
+	 * (graceful degrade, never a skip).
+	 */
+	private static function resolveWindowTime($zone, $key, $default_min)
+	{
+		$value = (string) ( $zone[$key] ?? '' );
+		$name  = $zone['name'] ?? 'Zone';
+
+		if (preg_match('/^(sunrise|sunset)([+-]\d+)?$/', $value, $m)) {
+			$offset = isset($m[2]) && $m[2] !== '' ? (int) $m[2] : 0;
+			$base   = $m[1] === 'sunrise' ? Weather::getSunrise() : Weather::getSunset();
+
+			if ($base === null) {
+				$default_time = static::minutesToTime($default_min);
+				echo sprintf(
+					'[schedule] %s: %s %s unresolved (no sunrise/sunset forecast) — using default %s',
+					$name,
+					$key,
+					$value,
+					$default_time
+				) . PHP_EOL;
+				return $default_min;
+			}
+
+			$parts   = explode(':', $base);
+			$minutes = (int) $parts[0] * 60 + (int) $parts[1] + $offset;
+			$minutes = max(0, min(1439, $minutes));
+
+			$label = $offset !== 0
+				? sprintf('%s%+d', $m[1], $offset)
+				: $m[1];
+			echo sprintf('[schedule] %s: %s %s → %s', $name, $key, $label, static::minutesToTime($minutes)) . PHP_EOL;
+			return $minutes;
+		}
+
+		$parts  = explode(':', $value);
+		$hh     = (int) ( $parts[0] ?? 0 );
+		$mm     = (int) ( $parts[1] ?? 0 );
+		return max(0, min(1439, $hh * 60 + $mm));
+	}
+
+	private static function anyZoneUsesBell()
+	{
+		foreach (static::$zones as $zone) {
+			if (empty($zone['enabled']) || empty($zone['auto_schedule'])) {
+				continue;
+			}
+			if (isset($zone['window_end']) && ($zone['placement_curve'] ?? '') === 'bell') {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Bell-curve run placement: invert the windowed hourly-ET0 CDF at even
+	 * thresholds so runs cluster in the peak-evapotranspiration hours. Returns
+	 * run-minute offsets, or null when hourly data is unavailable/zero (caller
+	 * falls back to uniform placement).
+	 */
+	private static function bellRunTimes($start, $end, $total_runs, $name)
+	{
+		$hourly = Weather::getHourlyET0(date('Y-m-d', Clock::now()));
+		if ($hourly === null) {
+			echo sprintf('[schedule] %s: bell curve requested but hourly ET0 unavailable — using uniform placement', $name) . PHP_EOL;
+			return null;
+		}
+
+		$cdf   = [];
+		$total = 0.0;
+		for ($m = (int) $start; $m < $end; $m++) {
+			$total += $hourly[intdiv($m, 60)] / 60.0; // each hour spread evenly over its minutes
+			$cdf[$m] = $total;
+		}
+
+		if ($total <= 0) {
+			echo sprintf('[schedule] %s: bell curve requested but hourly ET0 is 0 across the window — using uniform placement', $name) . PHP_EOL;
+			return null;
+		}
+
+		$starts = [];
+		for ($i = 0; $i < $total_runs; $i++) {
+			if ($total_runs === 1 || $i === 0) {
+				$starts[] = (float) $start;
+				continue;
+			}
+			if ($i === $total_runs - 1) {
+				$starts[] = (float) $end;
+				continue;
+			}
+
+			$target = ($i / ($total_runs - 1)) * $total;
+			$lo     = (int) $start;
+			$hi     = (int) ($end - 1);
+
+			if ($cdf[$lo] >= $target) {
+				$starts[] = (float) $start;
+				continue;
+			}
+
+			while ($hi - $lo > 1) {
+				$mid = intdiv($lo + $hi, 2);
+				if ($cdf[$mid] < $target) {
+					$lo = $mid;
+				} else {
+					$hi = $mid;
+				}
+			}
+
+			$a    = $cdf[$lo];
+			$b    = $cdf[$hi];
+			$frac = ($b - $a) > 0 ? ($target - $a) / ($b - $a) : 0.0;
+			$starts[] = $lo + $frac;
+		}
+
+		return $starts;
+	}
+
+	/**
+	 * Expands a list of logical run starts into the final run list: each run is
+	 * split into sub-cycles (spaced by duration + soak) and the "sub-cycles
+	 * extend past the next run" warning is emitted when needed.
+	 */
+	private static function emitRuns(array $run_starts, $end, $name, $duration_s, $max_cycle_minutes, $soak_minutes)
+	{
+		$runs  = [];
+		$count = count($run_starts);
+
+		foreach ($run_starts as $i => $run_start) {
+			$cycles = static::splitCycles($duration_s, $max_cycle_minutes, $soak_minutes);
+			$t      = $run_start;
+			foreach ($cycles as $cycle_s) {
+				$runs[] = [
+					'time'       => static::minutesToTime($t),
+					'duration_s' => $cycle_s,
+				];
+				$t += $cycle_s / 60 + $soak_minutes;
+			}
+
+			$next_start = ($i + 1 < $count) ? $run_starts[$i + 1] : null;
+			$boundary   = $next_start !== null ? min($end, $next_start) : $end;
+			$water_end  = $t - count($cycles) * $soak_minutes;
+			if (count($cycles) > 1 && $water_end > $boundary) {
+				echo sprintf(
+					'[schedule] %s: sub-cycles for run %d extend past %s — consider raising max_cycle_minutes or window_end',
+					$name,
+					$i + 1,
+					static::minutesToTime($boundary)
+				) . PHP_EOL;
+			}
+		}
+
+		return $runs;
+	}
+
 	private static function buildDailySchedule($device_zone, $zone, $interval_hr)
 	{
 		$name   = $zone['name'] ?? 'Zone';
-		$window = $zone['window_start'];
-
-		$parts = explode(':', $window);
-		$start = (int) $parts[0] * 60 + (int) $parts[1];
+		$start  = static::resolveWindowTime($zone, 'window_start', 6 * 60);
 
 		$max_runs = isset($zone['max_runs']) ? (int) $zone['max_runs'] : 6;
 		if ($max_runs < 1) $max_runs = 1;
@@ -573,15 +730,14 @@ class Rachio
 		$temperature       = (int) Weather::getTemperature($temperature_basis);
 
 		if (isset($zone['window_end'])) {
-			$end_parts = explode(':', $zone['window_end']);
-			$end       = (int) $end_parts[0] * 60 + (int) $end_parts[1];
+			$end = static::resolveWindowTime($zone, 'window_end', 19 * 60);
 
 			if ($end <= $start) {
 				echo sprintf(
 					'[schedule] %s: window_end (%s) must be later than window_start (%s) — skipping zone',
 					$name,
-					$zone['window_end'],
-					$window
+					static::minutesToTime($end),
+					static::minutesToTime($start)
 				) . PHP_EOL;
 				return [];
 			}
@@ -591,7 +747,11 @@ class Rachio
 				$total_runs = $max_runs;
 			}
 
-			$spacing = $total_runs > 1 ? ($end - $start) / ($total_runs - 1) : 0;
+			$curve = isset($zone['placement_curve']) ? (string) $zone['placement_curve'] : 'uniform';
+			if ($curve !== 'uniform' && $curve !== 'bell') {
+				echo sprintf('[schedule] %s: unknown placement_curve %s — using uniform', $name, $curve) . PHP_EOL;
+				$curve = 'uniform';
+			}
 
 			if ($auto || !isset($zone['fixed_runtime'])) {
 				$per_run = (float) Model::getRunDose($basis_m, $temperature);
@@ -608,36 +768,38 @@ class Rachio
 				return [];
 			}
 
-			$runs = [];
-			for ($i = 0; $i < $total_runs; $i++) {
-				$run_start = $start + $i * $spacing;
-
-				$cycles = static::splitCycles($duration_s, $max_cycle_minutes, $soak_minutes);
-				$t      = $run_start;
-				foreach ($cycles as $cycle_s) {
-					$runs[] = [
-						'time'       => static::minutesToTime($t),
-						'duration_s' => $cycle_s,
-					];
-					$t += $cycle_s / 60 + $soak_minutes;
+			$run_starts = [];
+			if ($curve === 'bell') {
+				$run_starts = static::bellRunTimes($start, $end, $total_runs, $name);
+				if ($run_starts === null) {
+					$run_starts = [];
+					$curve      = 'uniform'; // degraded — the warning above says why
 				}
-
-				$next_start = ($i + 1 < $total_runs) ? $start + ($i + 1) * $spacing : null;
-				$boundary   = $next_start !== null ? min($end, $next_start) : $end;
-				$water_end  = $t - count($cycles) * $soak_minutes;
-				if (count($cycles) > 1 && $water_end > $boundary) {
-					echo sprintf(
-						'[schedule] %s: sub-cycles for run %d extend past %s — consider raising max_cycle_minutes or window_end',
-						$name,
-						$i + 1,
-						static::minutesToTime($boundary)
-					) . PHP_EOL;
+			}
+			if ($run_starts === []) {
+				$spacing = $total_runs > 1 ? ($end - $start) / ($total_runs - 1) : 0;
+				for ($i = 0; $i < $total_runs; $i++) {
+					$run_starts[] = $start + $i * $spacing;
 				}
 			}
 
-			echo sprintf('[schedule] %s: %d runs over %s–%s (window_end)', $name, $total_runs, $window, $zone['window_end']) . PHP_EOL;
+			$runs = static::emitRuns($run_starts, $end, $name, $duration_s, $max_cycle_minutes, $soak_minutes);
 
-			return $runs;
+			echo sprintf(
+				'[schedule] %s: %d runs over %s–%s (window_end%s)',
+				$name,
+				$total_runs,
+				static::minutesToTime($start),
+				static::minutesToTime($end),
+				$curve === 'bell' ? ' bell' : ''
+			) . PHP_EOL;
+
+			return [
+				'runs'         => $runs,
+				'placement'    => $curve,
+				'window_start' => static::minutesToTime($start),
+				'window_end'   => static::minutesToTime($end),
+			];
 		}
 
 		$runs    = [];
@@ -675,7 +837,12 @@ class Rachio
 			$now_min = max($now_min + $step, $t);
 		}
 
-		return $runs;
+		return [
+			'runs'         => $runs,
+			'placement'    => 'uniform', // no window_end — placement_curve is ignored
+			'window_start' => static::minutesToTime($start),
+			'window_end'   => null,
+		];
 	}
 
 	private static function dailyScheduleFor($number)
@@ -733,15 +900,28 @@ class Rachio
 			return [];
 		}
 
-		$runs = static::buildDailySchedule($device_zone, $zone, $interval_hr);
+		$result = static::buildDailySchedule($device_zone, $zone, $interval_hr);
+		if (isset($result['runs'])) {
+			ScheduleCache::write($number, $date, [
+				'computed_at'  => time(),
+				'interval_hr'  => $interval_hr,
+				'runs'         => $result['runs'],
+				'placement'    => $result['placement'],
+				'window_start' => $result['window_start'],
+				'window_end'   => $result['window_end'],
+			]);
 
+			return $result['runs'];
+		}
+
+		// buildDailySchedule returned [] (validation skip) — cache the empty result
 		ScheduleCache::write($number, $date, [
 			'computed_at' => time(),
 			'interval_hr' => $interval_hr,
-			'runs'        => $runs,
+			'runs'        => $result,
 		]);
 
-		return $runs;
+		return $result;
 	}
 
 	private static function deviceZoneFor($device, $number)
@@ -897,17 +1077,22 @@ class Weather
 	private const CACHE_FILE    = '/tmp/wachio_weather.json';
 	private const CACHE_MAX_AGE = 12 * 3600; // 12 hours
 
-	public static function request($latitude, $longitude, $timezone)
+	public static function request($latitude, $longitude, $timezone, $need_hourly = false)
 	{
-		$url = 'https://api.open-meteo.com/v1/forecast?' . http_build_query([
+		$query = [
 			'latitude'            => $latitude,
 			'longitude'           => $longitude,
-			'daily'               => 'temperature_2m_max,temperature_2m_min,precipitation_probability_max,et0_fao_evapotranspiration',
+			'daily'               => 'temperature_2m_max,temperature_2m_min,precipitation_probability_max,et0_fao_evapotranspiration,sunrise,sunset',
 			'temperature_unit'    => 'fahrenheit',
 			'precipitation_unit'  => 'inch', // et0_fao_evapotranspiration is mm unless this is set
 			'timezone'            => $timezone,
 			'forecast_days'       => 7,
-		]);
+		];
+		if ($need_hourly) {
+			$query['hourly'] = 'et0_fao_evapotranspiration';
+		}
+
+		$url = 'https://api.open-meteo.com/v1/forecast?' . http_build_query($query);
 
 		try {
 			$result = static::fetch($url);
@@ -941,6 +1126,17 @@ class Weather
 		return static::$loaded;
 	}
 
+	/**
+	 * Test seam (mirrors Clock::set): injects synthetic forecast data so schedule
+	 * logic can be exercised deterministically without a network request.
+	 */
+	public static function injectForTest(array $data)
+	{
+		static::$data = $data;
+		static::$fallback_full = false;
+		static::$loaded = true;
+	}
+
 	private static function fetch($url)
 	{
 		$transient = [429, 500, 502, 503, 504];
@@ -965,6 +1161,9 @@ class Weather
 			throw new \RuntimeException('Unexpected weather response');
 		}
 
+		$hourly_data = $data->hourly ?? null;
+		$hunit       = strtolower((string) ( $data->hourly_units->et0_fao_evapotranspiration ?? 'mm' ));
+
 		$daily = $data->daily;
 		$unit  = strtolower((string) ( $data->daily_units->et0_fao_evapotranspiration ?? 'mm' ));
 		$data  = [];
@@ -980,12 +1179,31 @@ class Weather
 			}
 
 			$data[$date] = [
-				'high' => $high,
-				'low'  => $low,
-				'avg'  => (int) (($high + $low) / 2),
-				'rain' => $precip > 50,
-				'et0'  => $et0,
+				'high'    => $high,
+				'low'     => $low,
+				'avg'     => (int) (($high + $low) / 2),
+				'rain'    => $precip > 50,
+				'et0'     => $et0,
+				'sunrise' => (string) ( $daily->sunrise[$i] ?? '' ),
+				'sunset'  => (string) ( $daily->sunset[$i] ?? '' ),
 			];
+		}
+
+		if ($hourly_data !== null && isset($hourly_data->time, $hourly_data->et0_fao_evapotranspiration)) {
+			$by_date = [];
+			for ($i = 0; $i < count($hourly_data->time); $i++) {
+				$d    = substr((string) $hourly_data->time[$i], 0, 10);
+				$hval = (float) $hourly_data->et0_fao_evapotranspiration[$i];
+				if ($hunit === 'mm') {
+					$hval = $hval / 25.4;
+				}
+				$by_date[$d][] = $hval;
+			}
+			foreach ($by_date as $d => $values) {
+				if (isset($data[$d])) {
+					$data[$d]['hourly_et0'] = $values;
+				}
+			}
 		}
 
 		return $data;
@@ -995,6 +1213,7 @@ class Weather
 	{
 		@file_put_contents(static::CACHE_FILE, json_encode([
 			'cached_at' => time(),
+			'schema'    => 2,
 			'data'      => $data,
 		]));
 	}
@@ -1005,6 +1224,9 @@ class Weather
 		$j   = json_decode($raw === false ? '' : $raw, true);
 		if (!is_array($j) || !isset($j['cached_at'], $j['data']) || !is_array($j['data'])) {
 			return null;
+		}
+		if ((int) ( $j['schema'] ?? 1 ) !== 2) {
+			return null; // stale schema (e.g. pre-sunrise/sunset/hourly) — force a refetch
 		}
 		if (time() - (int) $j['cached_at'] > static::CACHE_MAX_AGE) {
 			return null;
@@ -1061,6 +1283,47 @@ class Weather
 		}
 
 		return $et0;
+	}
+
+	/** Returns 'HH:MM' of today's sunrise, or null when unavailable. */
+	public static function getSunrise()
+	{
+		return static::solarTime('sunrise');
+	}
+
+	/** Returns 'HH:MM' of today's sunset, or null when unavailable. */
+	public static function getSunset()
+	{
+		return static::solarTime('sunset');
+	}
+
+	/** Returns the 24-value hourly ET0 array for $date, or null when unavailable. */
+	public static function getHourlyET0($date)
+	{
+		if (static::$fallback_full) {
+			return null;
+		}
+
+		$h = static::$data[$date]['hourly_et0'] ?? null;
+		if (!is_array($h) || count($h) < 24) {
+			return null;
+		}
+
+		return array_values(array_slice($h, 0, 24));
+	}
+
+	private static function solarTime($key)
+	{
+		if (static::$fallback_full) {
+			return null;
+		}
+
+		$iso = static::$data[date('Y-m-d', Clock::now())][$key] ?? '';
+		if ($iso === '' || strpos($iso, 'T') === false) {
+			return null;
+		}
+
+		return (string) substr($iso, -5); // HH:MM from the ISO datetime
 	}
 }
 
@@ -1138,4 +1401,6 @@ class Curl
 	}
 }
 
-\W\Rachio::run();
+if (!defined('WACHIO_TEST')) {
+	\W\Rachio::run();
+}
