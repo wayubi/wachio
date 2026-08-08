@@ -572,6 +572,74 @@ class Rachio
 		$temperature_basis = Model::getTemperatureBasis(static::$timezone);
 		$temperature       = (int) Weather::getTemperature($temperature_basis);
 
+		if (isset($zone['window_end'])) {
+			$end_parts = explode(':', $zone['window_end']);
+			$end       = (int) $end_parts[0] * 60 + (int) $end_parts[1];
+
+			if ($end <= $start) {
+				echo sprintf(
+					'[schedule] %s: window_end (%s) must be later than window_start (%s) — skipping zone',
+					$name,
+					$zone['window_end'],
+					$window
+				) . PHP_EOL;
+				return [];
+			}
+
+			$total_runs = max(1, (int) round(24 / $interval_hr));
+			if ($total_runs > $max_runs) {
+				$total_runs = $max_runs;
+			}
+
+			$spacing = $total_runs > 1 ? ($end - $start) / ($total_runs - 1) : 0;
+
+			if ($auto || !isset($zone['fixed_runtime'])) {
+				$per_run = (float) Model::getRunDose($basis_m, $temperature);
+				if (isset($zone['max_runtime']) && $per_run > (float) $zone['max_runtime']) {
+					$per_run = (float) $zone['max_runtime'];
+				}
+			} else {
+				$per_run = (float) $basis_m;
+			}
+			$duration_s = (int) round($per_run * 60);
+
+			if ($duration_s < 1) {
+				echo sprintf('[schedule] %s: skip %s (computed runtime is 0)', $name, static::minutesToTime($start)) . PHP_EOL;
+				return [];
+			}
+
+			$runs = [];
+			for ($i = 0; $i < $total_runs; $i++) {
+				$run_start = $start + $i * $spacing;
+
+				$cycles = static::splitCycles($duration_s, $max_cycle_minutes, $soak_minutes);
+				$t      = $run_start;
+				foreach ($cycles as $cycle_s) {
+					$runs[] = [
+						'time'       => static::minutesToTime($t),
+						'duration_s' => $cycle_s,
+					];
+					$t += $cycle_s / 60 + $soak_minutes;
+				}
+
+				$next_start = ($i + 1 < $total_runs) ? $start + ($i + 1) * $spacing : null;
+				$boundary   = $next_start !== null ? min($end, $next_start) : $end;
+				$water_end  = $t - count($cycles) * $soak_minutes;
+				if (count($cycles) > 1 && $water_end > $boundary) {
+					echo sprintf(
+						'[schedule] %s: sub-cycles for run %d extend past %s — consider raising max_cycle_minutes or window_end',
+						$name,
+						$i + 1,
+						static::minutesToTime($boundary)
+					) . PHP_EOL;
+				}
+			}
+
+			echo sprintf('[schedule] %s: %d runs over %s–%s (window_end)', $name, $total_runs, $window, $zone['window_end']) . PHP_EOL;
+
+			return $runs;
+		}
+
 		$runs    = [];
 		$now_min = (float) $start;
 		$step    = $interval_hr * 60;

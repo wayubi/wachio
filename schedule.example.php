@@ -51,6 +51,12 @@
  *                   + manual duration.
  * - window_start : HH:MM of the first run of the day (required with
  *                  auto_schedule); later runs are spaced by the interval
+ * - window_end   : optional HH:MM of the last run of the day. When set, the
+ *                  equation-determined run count is preserved but the runs are
+ *                  compressed evenly into the window_start-window_end span
+ *                  instead of spilling toward midnight. Must be later than
+ *                  window_start. Does not change total daily water (unless
+ *                  max_runs caps the count, which reduces water accordingly).
  * - max_runs     : safety cap on runs (and split sub-cycles) per day
  *                  (auto_schedule only; default 6)
  * - max_cycle_minutes : single runs longer than this (min) are split into
@@ -159,6 +165,8 @@ return [
 		//     'auto_schedule'    => true,             // frequency from bucket ÷ (Kc × ET0)
 		//     // Kc comes from the controller (customCrop.coefficient); no config needed
 		//     'window_start'     => '05:30',          // first run of the day (required)
+		//     'window_end'       => '19:00',          // optional: keep runs within daylight
+		//                                            // hours (germination/seedbed zones)
 		//     'max_runs'         => 6,                // optional safety cap (default 6)
 		//     'max_cycle_minutes' => 10,              // optional cycle split threshold (default 10)
 		//     'soak_minutes'     => 20,               // optional soak gap (default 20)
